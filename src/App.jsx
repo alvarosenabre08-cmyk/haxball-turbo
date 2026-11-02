@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 9;
+const GAME_VERSION = 10;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -114,6 +114,8 @@ const GOAL_RESET_MS = 2000; // tiempo entre el gol y el saque
 const CENTER_R = 75; // círculo central (saque)
 const ROOM_STALE_MS = 10 * 60 * 1000; // salas sin actividad 10 min → se borran
 const ACTIVE_EVERY_MS = 60 * 1000; // el host marca la sala como activa cada minuto
+const LOBBY_EVERY_MS = 10 * 1000; // el host actualiza la lista de salas cada 10 s
+const LOBBY_FRESH_MS = 45 * 1000; // en la lista solo salen salas actualizadas hace < 45 s
 
 // Opciones de partido (0 = sin límite)
 const SCORE_LIMITS = [0, 3, 5, 7, 10];
@@ -258,8 +260,7 @@ const estimatePresent = (p, tickRate) => {
     p.cvy = p.vy || 0;
     return;
   }
-  const ticks =
-    (Math.min(Math.max(Date.now() - lastS.t, 0), 150) / 1000) * tickRate;
+  const ticks = (Math.min(Math.max(Date.now() - lastS.t, 0), 150) / 1000) * tickRate;
   p.cx = lastS.x + lastS.vx * ticks;
   p.cy = lastS.y + lastS.vy * ticks;
   p.cvx = lastS.vx;
@@ -448,12 +449,7 @@ function buildField() {
   g.fillRect(0, 0, CW, PITCH.top);
   g.fillRect(0, PITCH.bottom, CW, CH - PITCH.bottom);
   g.fillRect(0, PITCH.top, PITCH.left, PITCH.bottom - PITCH.top);
-  g.fillRect(
-    PITCH.right,
-    PITCH.top,
-    CW - PITCH.right,
-    PITCH.bottom - PITCH.top
-  );
+  g.fillRect(PITCH.right, PITCH.top, CW - PITCH.right, PITCH.bottom - PITCH.top);
 
   // Paredes: una franja clara pegada a la línea para que se vean bien
   g.fillStyle = "rgba(255,255,255,0.06)";
@@ -777,6 +773,10 @@ export default function App() {
   const [playerName, setPlayerName] = useState("");
   const [roomId, setRoomId] = useState("");
   const [inputRoomId, setInputRoomId] = useState("");
+  const [roomName, setRoomName] = useState("");
+  const [isPublic, setIsPublic] = useState(true);
+  const [lobbyRooms, setLobbyRooms] = useState([]); // salas públicas
+  const [, setLobbyTick] = useState(0); // para refrescar la lista cada poco
   const [selectedTeam, setSelectedTeam] = useState("red");
   const [chatMessage, setChatMessage] = useState("");
   const [copied, setCopied] = useState(false);
@@ -921,8 +921,7 @@ export default function App() {
       const c = own.current.c + 1;
       own.current = { c, o: uid };
       const last = metaNow.current.lastGoalTeam;
-      const kickoffTeam =
-        last === "red" ? "blue" : last === "blue" ? "red" : "red";
+      const kickoffTeam = last === "red" ? "blue" : last === "blue" ? "red" : "red";
       const patch = {};
       Object.entries({
         kickoff: serverNow(),
@@ -933,11 +932,7 @@ export default function App() {
       }).forEach(([k, v]) => {
         patch[`meta/${k}`] = v;
       });
-      patch.ball = encBall(
-        { x: CX, y: CY, vx: 0, vy: 0, k: ball.current.k },
-        c,
-        uid
-      );
+      patch.ball = encBall({ x: CX, y: CY, vx: 0, vy: 0, k: ball.current.k }, c, uid);
       patch.touch = null;
       Object.assign(patch, extraPatch);
       update(baseRef, patch).catch(() => {});
@@ -1134,8 +1129,7 @@ export default function App() {
 
       // Solo acepto mensajes del dueño más reciente
       const cur = own.current;
-      const newer =
-        v.c > cur.c || (v.c === cur.c && (v.o || "") >= (cur.o || ""));
+      const newer = v.c > cur.c || (v.c === cur.c && (v.o || "") >= (cur.o || ""));
       if (!newer) return;
       const wasOwner = cur.o === uid;
       own.current = { c: v.c, o: v.o };
@@ -1182,10 +1176,44 @@ export default function App() {
 
     // Tareas del host: fin del tiempo / prórroga y marcar la sala como activa
     let lastActiveMark = 0;
+    let lastLobbyMark = 0;
+    let lastLobbyKey = "";
+    let lobbyOnDisconnect = false;
+    const lobbyRef = ref(db, `lobby/${roomId}`);
     const hostTimer = setInterval(() => {
       if (!isHost.current) return;
       const m = metaNow.current;
       const t = serverNow();
+
+      // Lista de salas públicas: el host mantiene la ficha de su sala al día
+      if (m.isPublic) {
+        const entry = {
+          name: m.name || `Sala ${roomId}`,
+          host: players.current[uid]?.name || "?",
+          count: playerIds.current.length,
+          max: MAX_PLAYERS,
+          scoreRed: m.scoreRed || 0,
+          scoreBlue: m.scoreBlue || 0,
+          over: m.phase === "over",
+          v: GAME_VERSION,
+        };
+        const key = JSON.stringify(entry);
+        if (key !== lastLobbyKey || t - lastLobbyMark > LOBBY_EVERY_MS) {
+          lastLobbyKey = key;
+          lastLobbyMark = t;
+          set(lobbyRef, { ...entry, lastActive: t }).catch(() => {});
+          if (!lobbyOnDisconnect) {
+            // si el host se desconecta, la ficha desaparece (el nuevo host la vuelve a crear)
+            onDisconnect(lobbyRef).remove();
+            lobbyOnDisconnect = true;
+          }
+        }
+      } else if (lastLobbyKey) {
+        // La sala ha pasado a privada: se quita de la lista
+        lastLobbyKey = "";
+        remove(lobbyRef).catch(() => {});
+      }
+
       if (t - lastActiveMark > ACTIVE_EVERY_MS) {
         lastActiveMark = t;
         update(ref(db, `${base}/meta`), { lastActive: t }).catch(() => {});
@@ -1220,14 +1248,10 @@ export default function App() {
       if (!document.hidden || own.current.o !== uid) return;
       const others = playerIds.current.filter((id) => id !== uid);
       if (!others.length) return;
-      const o = others.includes(hostIdRef.current)
-        ? hostIdRef.current
-        : others[0];
+      const o = others.includes(hostIdRef.current) ? hostIdRef.current : others[0];
       const c = own.current.c + 1;
       own.current = { c, o };
-      update(baseRef, { ball: encBall(ball.current, c, o, true) }).catch(
-        () => {}
-      );
+      update(baseRef, { ball: encBall(ball.current, c, o, true) }).catch(() => {});
     };
     document.addEventListener("visibilitychange", onVisibility);
 
@@ -1254,6 +1278,28 @@ export default function App() {
     };
   }, [user, roomId]);
 
+  // Lista de salas públicas (solo mientras estás en el menú)
+  useEffect(() => {
+    if (!user || roomId) return;
+    const unsub = onValue(
+      ref(db, "lobby"),
+      (snap) => {
+        const list = [];
+        snap.forEach((child) => {
+          list.push({ id: child.key, ...child.val() });
+        });
+        setLobbyRooms(list);
+      },
+      (err) => console.warn("No se pudo leer la lista de salas:", err.message)
+    );
+    // Refresca cada 10 s para quitar las salas que se han quedado sin host
+    const t = setInterval(() => setLobbyTick((n) => n + 1), 10000);
+    return () => {
+      unsub();
+      clearInterval(t);
+    };
+  }, [user, roomId]);
+
   // 3. Reloj
   useEffect(() => {
     if (!meta?.startedAt) return;
@@ -1270,13 +1316,7 @@ export default function App() {
   useEffect(() => {
     const isTyping = () =>
       ["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName);
-    const blocked = [
-      "Space",
-      "ArrowUp",
-      "ArrowDown",
-      "ArrowLeft",
-      "ArrowRight",
-    ];
+    const blocked = ["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"];
     const kickKeys = ["Space", "KeyX"];
 
     const down = (e) => {
@@ -1491,8 +1531,7 @@ export default function App() {
           const dx = me.x - CX;
           const dy = me.y - CY;
           const d = Math.hypot(dx, dy) || 0.001;
-          const wrongSide =
-            me.team === "red" ? me.x > CX - PLAYER_R : me.x < CX + PLAYER_R;
+          const wrongSide = me.team === "red" ? me.x > CX - PLAYER_R : me.x < CX + PLAYER_R;
           if (kicking) {
             // Puede estar dentro del círculo; fuera de él, solo en su campo
             if (wrongSide && d > CENTER_R - PLAYER_R) {
@@ -1685,11 +1724,7 @@ export default function App() {
       const me = all[uid];
 
       // Seguridad: si algún número se ha estropeado (NaN), recolocar
-      if (
-        !Number.isFinite(b.x) ||
-        !Number.isFinite(b.y) ||
-        !Number.isFinite(b.vx)
-      ) {
+      if (!Number.isFinite(b.x) || !Number.isFinite(b.y) || !Number.isFinite(b.vx)) {
         b.x = b.px = CX;
         b.y = b.py = CY;
         b.vx = b.vy = 0;
@@ -1745,7 +1780,8 @@ export default function App() {
       checkStaleOwner();
 
       // Envío a la red (menos veces por segundo si hay mucha gente)
-      const syncMs = playerIds.current.length > 8 ? SYNC_MS_CROWDED : SYNC_MS;
+      const syncMs =
+        playerIds.current.length > 8 ? SYNC_MS_CROWDED : SYNC_MS;
       // (margen de 4 ms para que el ritmo de envío sea regular a 60/144 Hz)
       if (now - lastSync >= syncMs - 4) {
         lastSync = now;
@@ -1803,6 +1839,18 @@ export default function App() {
         await update(ref(db, "rooms"), patch);
         console.log(`Salas abandonadas borradas: ${Object.keys(patch).length}`);
       }
+      // Fichas de la lista pública que llevan rato sin actualizarse
+      const lq = query(
+        ref(db, "lobby"),
+        orderByChild("lastActive"),
+        endAt(serverNow() - ROOM_STALE_MS)
+      );
+      const lsnap = await get(lq);
+      const lpatch = {};
+      lsnap.forEach((child) => {
+        lpatch[child.key] = null;
+      });
+      if (Object.keys(lpatch).length) await update(ref(db, "lobby"), lpatch);
     } catch (e) {
       console.warn("No se pudieron limpiar salas viejas:", e.message);
     }
@@ -1838,6 +1886,8 @@ export default function App() {
           kickoffActive: true,
           kickoffTeam: "red",
           v: GAME_VERSION,
+          name: roomName.trim() || `Sala de ${name}`,
+          isPublic,
         },
         ball: encBall({ x: CX, y: CY, vx: 0, vy: 0, k: 0 }, 0, user.uid),
         players: { [user.uid]: { name, team: selectedTeam } },
@@ -1850,11 +1900,13 @@ export default function App() {
     }
   };
 
-  const joinRoom = async () => {
+  const joinRoom = async (codeArg) => {
     if (!user) return;
     const name = playerName.trim();
     if (!name) return alert("Ingresa tu nombre primero");
-    const code = inputRoomId.trim().toUpperCase();
+    const code = (typeof codeArg === "string" ? codeArg : inputRoomId)
+      .trim()
+      .toUpperCase();
     if (!code) return alert("Ingresa un código de sala");
 
     try {
@@ -1891,6 +1943,7 @@ export default function App() {
   const leaveRoom = () => {
     if (playerIds.current.length <= 1) {
       remove(ref(db, `rooms/${roomId}`)).catch(() => {});
+      remove(ref(db, `lobby/${roomId}`)).catch(() => {});
     }
     setRoomId("");
     setMeta(null);
@@ -1973,6 +2026,15 @@ export default function App() {
     }))
     .sort((x, y) => y.g - x.g || y.a - x.a);
 
+  // Salas públicas que siguen vivas y son de esta versión, las más llenas primero
+  const visibleRooms = lobbyRooms
+    .filter(
+      (r) =>
+        r.v === GAME_VERSION &&
+        serverNow() - (r.lastActive || 0) < LOBBY_FRESH_MS
+    )
+    .sort((a, b) => (b.count || 0) - (a.count || 0));
+
   const sendChat = (e) => {
     e.preventDefault();
     const text = chatMessage.trim();
@@ -1996,6 +2058,7 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+
   // ----------------------------------------------------
   // Interfaz
   // ----------------------------------------------------
@@ -2018,7 +2081,12 @@ export default function App() {
 
         {roomId && (
           <div className="flex items-center gap-4 bg-slate-950/80 border border-slate-800 px-4 py-1.5 rounded-full shadow-inner">
-            <span className="text-xs text-slate-400">Código de Sala:</span>
+            {meta?.name && (
+              <span className="text-xs text-slate-200 font-bold max-w-[180px] truncate">
+                {meta.name}
+              </span>
+            )}
+            <span className="text-xs text-slate-400">Código:</span>
             <span className="font-mono font-black text-amber-400 tracking-widest text-sm">
               {roomId}
             </span>
@@ -2064,7 +2132,8 @@ export default function App() {
 
       {!roomId ? (
         <main className="flex-1 flex items-center justify-center p-6 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black">
-          <div className="max-w-md w-full bg-slate-900/90 border border-slate-800 rounded-3xl p-8 shadow-2xl backdrop-blur space-y-6">
+          <div className="w-full max-w-5xl flex flex-col lg:flex-row gap-6 items-stretch justify-center">
+          <div className="lg:max-w-md w-full bg-slate-900/90 border border-slate-800 rounded-3xl p-8 shadow-2xl backdrop-blur space-y-6">
             <div className="text-center space-y-2">
               <h2 className="text-3xl font-black text-white flex items-center justify-center gap-2">
                 ¡Entra al Partido!{" "}
@@ -2128,6 +2197,37 @@ export default function App() {
 
               <hr className="border-slate-800 my-4" />
 
+              <div className="space-y-3">
+                <input
+                  type="text"
+                  maxLength={28}
+                  value={roomName}
+                  onChange={(e) => setRoomName(e.target.value)}
+                  placeholder={`Nombre de la sala (ej. Sala de ${playerName || "Crack"})`}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-white text-sm focus:outline-none focus:border-emerald-500 transition"
+                />
+                <div className="grid grid-cols-2 gap-2 text-xs font-bold">
+                  {[
+                    { val: true, label: "🌍 Pública", hint: "Sale en la lista" },
+                    { val: false, label: "🔒 Privada", hint: "Solo con código" },
+                  ].map((o) => (
+                    <button
+                      key={o.label}
+                      type="button"
+                      onClick={() => setIsPublic(o.val)}
+                      className={`py-2 rounded-xl border transition flex flex-col items-center ${
+                        isPublic === o.val
+                          ? "bg-emerald-500/15 border-emerald-500 text-emerald-300"
+                          : "bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700"
+                      }`}
+                    >
+                      {o.label}
+                      <span className="text-[10px] font-medium opacity-70">{o.hint}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <button
                 onClick={createRoom}
                 disabled={!user}
@@ -2163,6 +2263,62 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          {/* Lista de salas públicas */}
+          <div className="w-full lg:max-w-lg bg-slate-900/90 border border-slate-800 rounded-3xl p-6 shadow-2xl backdrop-blur flex flex-col min-h-[320px]">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-black text-white flex items-center gap-2">
+                <Users className="w-5 h-5 text-emerald-400" /> Salas públicas
+              </h3>
+              <span className="text-xs text-slate-400 font-mono">
+                {visibleRooms.length} {visibleRooms.length === 1 ? "sala" : "salas"}
+              </span>
+            </div>
+
+            {visibleRooms.length === 0 ? (
+              <div className="flex-1 flex flex-col items-center justify-center text-center text-slate-500 text-sm gap-1">
+                <span>No hay salas públicas ahora mismo.</span>
+                <span className="text-xs">¡Crea una y aparecerá aquí para todos!</span>
+              </div>
+            ) : (
+              <div className="flex-1 overflow-y-auto space-y-2 pr-1 max-h-[460px]">
+                {visibleRooms.map((r) => {
+                  const full = (r.count || 0) >= (r.max || MAX_PLAYERS);
+                  return (
+                    <div
+                      key={r.id}
+                      className="flex items-center gap-3 bg-slate-950/80 border border-slate-800 rounded-2xl px-4 py-3"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="font-bold text-slate-100 truncate">{r.name}</div>
+                        <div className="text-[11px] text-slate-400 truncate">
+                          Host: {r.host} ·{" "}
+                          <span style={{ color: RED }}>{r.scoreRed || 0}</span>-
+                          <span style={{ color: BLUE }}>{r.scoreBlue || 0}</span>
+                          {r.over ? " · terminado" : ""}
+                        </div>
+                      </div>
+                      <span
+                        className={`text-xs font-mono font-bold ${
+                          full ? "text-red-400" : "text-emerald-400"
+                        }`}
+                      >
+                        {r.count || 0}/{r.max || MAX_PLAYERS}
+                      </span>
+                      <button
+                        onClick={() => joinRoom(r.id)}
+                        disabled={!user || full}
+                        className="bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-black text-xs px-4 py-2 rounded-xl transition active:scale-95"
+                      >
+                        {full ? "Llena" : "Entrar"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          </div>
         </main>
       ) : (
         <main className="flex-1 flex flex-col xl:flex-row p-4 gap-4 max-w-[1300px] mx-auto w-full">
@@ -2170,10 +2326,7 @@ export default function App() {
             {/* Marcador */}
             <div className="w-full max-w-[900px] bg-slate-900/90 border border-slate-800 rounded-2xl px-5 py-3 flex items-center justify-between shadow-2xl">
               <div className="flex items-center gap-3">
-                <div
-                  className="w-3 h-10 rounded-full"
-                  style={{ background: RED }}
-                ></div>
+                <div className="w-3 h-10 rounded-full" style={{ background: RED }}></div>
                 <div>
                   <span className="text-[10px] text-slate-400 uppercase font-black tracking-wider block">
                     ROJO
@@ -2199,9 +2352,7 @@ export default function App() {
                   )}
                 </span>
                 <span className="text-[10px] text-slate-500 font-semibold">
-                  {meta?.scoreLimit
-                    ? `A ${meta.scoreLimit} goles`
-                    : "Sin límite de goles"}
+                  {meta?.scoreLimit ? `A ${meta.scoreLimit} goles` : "Sin límite de goles"}
                   {" · "}
                   {meta?.timeLimit ? `${meta.timeLimit} min` : "sin tiempo"}
                 </span>
@@ -2239,10 +2390,7 @@ export default function App() {
                     {meta?.scoreBlue || 0}
                   </span>
                 </div>
-                <div
-                  className="w-3 h-10 rounded-full"
-                  style={{ background: BLUE }}
-                ></div>
+                <div className="w-3 h-10 rounded-full" style={{ background: BLUE }}></div>
               </div>
             </div>
 
@@ -2263,20 +2411,16 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {meta?.kickoffActive &&
-                meta?.phase !== "over" &&
-                !meta?.banner && (
-                  <div className="absolute inset-x-0 top-3 flex justify-center pointer-events-none">
-                    <div
-                      className="text-white text-xs font-black px-3 py-1 rounded-full shadow"
-                      style={{
-                        background: meta.kickoffTeam === "blue" ? BLUE : RED,
-                      }}
-                    >
-                      SACA EL {meta.kickoffTeam === "blue" ? "AZUL" : "ROJO"}
-                    </div>
+              {meta?.kickoffActive && meta?.phase !== "over" && !meta?.banner && (
+                <div className="absolute inset-x-0 top-3 flex justify-center pointer-events-none">
+                  <div
+                    className="text-white text-xs font-black px-3 py-1 rounded-full shadow"
+                    style={{ background: meta.kickoffTeam === "blue" ? BLUE : RED }}
+                  >
+                    SACA EL {meta.kickoffTeam === "blue" ? "AZUL" : "ROJO"}
                   </div>
-                )}
+                </div>
+              )}
               {meta?.phase === "over" && (
                 <div className="absolute inset-0 bg-slate-950/80 flex items-center justify-center p-4">
                   <div className="bg-slate-900 border border-slate-700 rounded-2xl p-5 w-full max-w-md text-center shadow-2xl">
@@ -2299,38 +2443,19 @@ export default function App() {
                       <table className="w-full text-xs mt-4">
                         <thead>
                           <tr className="text-slate-400">
-                            <th className="text-left font-semibold pb-1">
-                              Jugador
-                            </th>
-                            <th className="font-semibold pb-1" title="Goles">
-                              ⚽
-                            </th>
-                            <th
-                              className="font-semibold pb-1"
-                              title="Asistencias"
-                            >
-                              🅰️
-                            </th>
-                            <th
-                              className="font-semibold pb-1"
-                              title="Autogoles"
-                            >
-                              🙈
-                            </th>
+                            <th className="text-left font-semibold pb-1">Jugador</th>
+                            <th className="font-semibold pb-1" title="Goles">⚽</th>
+                            <th className="font-semibold pb-1" title="Asistencias">🅰️</th>
+                            <th className="font-semibold pb-1" title="Autogoles">🙈</th>
                           </tr>
                         </thead>
                         <tbody>
                           {statRows.map((r) => (
-                            <tr
-                              key={r.id}
-                              className="border-t border-slate-800"
-                            >
+                            <tr key={r.id} className="border-t border-slate-800">
                               <td className="text-left py-1 font-bold">
                                 <span
                                   className="inline-block w-2 h-2 rounded-full mr-1.5"
-                                  style={{
-                                    background: r.team === "blue" ? BLUE : RED,
-                                  }}
+                                  style={{ background: r.team === "blue" ? BLUE : RED }}
                                 ></span>
                                 {r.name}
                               </td>
@@ -2386,9 +2511,7 @@ export default function App() {
                     Goles
                     <select
                       value={meta?.scoreLimit || 0}
-                      onChange={(e) =>
-                        setMatchOption("scoreLimit", +e.target.value)
-                      }
+                      onChange={(e) => setMatchOption("scoreLimit", +e.target.value)}
                       className="bg-slate-800 text-slate-200 rounded-md px-1.5 py-0.5"
                     >
                       {SCORE_LIMITS.map((v) => (
@@ -2402,9 +2525,7 @@ export default function App() {
                     Tiempo
                     <select
                       value={meta?.timeLimit || 0}
-                      onChange={(e) =>
-                        setMatchOption("timeLimit", +e.target.value)
-                      }
+                      onChange={(e) => setMatchOption("timeLimit", +e.target.value)}
                       className="bg-slate-800 text-slate-200 rounded-md px-1.5 py-0.5"
                     >
                       {TIME_LIMITS.map((v) => (
@@ -2412,6 +2533,17 @@ export default function App() {
                           {v ? `${v} min` : "∞"}
                         </option>
                       ))}
+                    </select>
+                  </label>
+                  <label className="flex items-center gap-1">
+                    Sala
+                    <select
+                      value={meta?.isPublic ? "1" : "0"}
+                      onChange={(e) => setMatchOption("isPublic", e.target.value === "1")}
+                      className="bg-slate-800 text-slate-200 rounded-md px-1.5 py-0.5"
+                    >
+                      <option value="1">Pública</option>
+                      <option value="0">Privada</option>
                     </select>
                   </label>
                   <button
