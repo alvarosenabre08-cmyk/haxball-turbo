@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 10;
+const GAME_VERSION = 11;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -159,46 +159,64 @@ const lerp = (a, b, t) => a + (b - a) * t;
 const r1 = (v) => Math.round(v * 10) / 10;
 const r2 = (v) => Math.round(v * 100) / 100;
 
-// Formato compacto para la red: "x,y,vx,vy,chutando,hora"
-// La hora de envío sirve para colocar cada dato en su momento exacto
-// y que el movimiento de los demás se vea fluido aunque la red vaya a saltos.
-const posBody = (p) =>
-  `${r1(p.x)},${r1(p.y)},${r2(p.vx || 0)},${r2(p.vy || 0)},${
-    p.isKicking ? 1 : 0
-  }`;
-const encPos = (p) => `${posBody(p)},${Date.now()}`;
-const decPos = (s) => {
-  if (typeof s !== "string") return null;
-  const a = s.split(",");
+// ----------------------------------------------------
+// Red: el HOST calcula toda la física (jugadores y balón) y manda una
+// "foto" del partido 30 veces por segundo. Los demás solo envían qué
+// teclas pulsan. Así todos ven exactamente el mismo balón.
+// ----------------------------------------------------
+const BIT_UP = 1;
+const BIT_DOWN = 2;
+const BIT_LEFT = 4;
+const BIT_RIGHT = 8;
+const BIT_KICK = 16;
+
+// Identificador corto de cada jugador para que la foto ocupe poco
+const sidOf = (uid) => uid.slice(0, 6);
+
+// Foto del host: "hora|chuts|bx,by,bvx,bvy|sid,x,y,vx,vy,chutando,sinConexión|..."
+const encState = (t, k, b, ents, info) => {
+  let s = `${t}|${k}|${r1(b.x)},${r1(b.y)},${r2(b.vx)},${r2(b.vy)}`;
+  for (const id in ents) {
+    if (!info[id]) continue;
+    const p = ents[id];
+    s += `|${sidOf(id)},${r1(p.x)},${r1(p.y)},${r2(p.vx)},${r2(p.vy)},${
+      p.isKicking ? 1 : 0
+    },${p.stale ? 1 : 0}`;
+  }
+  return s;
+};
+const decState = (str) => {
+  if (typeof str !== "string") return null;
+  const parts = str.split("|");
+  if (parts.length < 3) return null;
+  const b = parts[2].split(",");
+  const players = [];
+  for (let i = 3; i < parts.length; i++) {
+    const a = parts[i].split(",");
+    players.push({
+      sid: a[0],
+      x: +a[1],
+      y: +a[2],
+      vx: +a[3] || 0,
+      vy: +a[4] || 0,
+      k: a[5] === "1",
+      s: a[6] === "1",
+    });
+  }
   return {
-    x: +a[0],
-    y: +a[1],
-    vx: +a[2] || 0,
-    vy: +a[3] || 0,
-    k: a[4] === "1",
-    t: +a[5] || 0, // 0 = sin hora (no se usa para calcular relojes)
+    t: +parts[0] || 0,
+    k: +parts[1] || 0,
+    ball: { x: +b[0], y: +b[1], vx: +b[2] || 0, vy: +b[3] || 0 },
+    players,
   };
 };
-// Balón: "x,y,vx,vy,chuts,cambioDeDueño,dueño,hora"
-const ballBody = (b, c, o) =>
-  `${r1(b.x)},${r1(b.y)},${r2(b.vx)},${r2(b.vy)},${b.k || 0},${c},${o || ""}`;
-// sinHora: cuando el que escribe no es el dueño (al pasar el balón a otro),
-// no ponemos su hora, porque es de otro reloj y descuadraría los cálculos
-const encBall = (b, c, o, sinHora = false) =>
-  `${ballBody(b, c, o)},${sinHora ? 0 : Date.now()}`;
-const decBall = (s) => {
-  if (typeof s !== "string") return null;
-  const a = s.split(",");
-  return {
-    x: +a[0],
-    y: +a[1],
-    vx: +a[2] || 0,
-    vy: +a[3] || 0,
-    k: +a[4] || 0,
-    c: +a[5] || 0,
-    o: a[6] || null,
-    t: +a[7] || 0,
-  };
+
+// Teclas de un jugador: "teclas,vecesQueHaPulsadoChutar"
+const encInput = (bits, kc) => `${bits},${kc}`;
+const decInput = (str) => {
+  if (typeof str !== "string") return null;
+  const a = str.split(",");
+  return { bits: +a[0] || 0, kc: +a[1] || 0 };
 };
 
 // Cada ordenador tiene su reloj: calculamos la diferencia con cada jugador
@@ -246,25 +264,6 @@ const interpPlayer = (p, renderT, tickRate) => {
   p.vy = lerp(a.vy, b.vy, f);
   // Tiramos lo viejo
   while (s.length > 2 && s[1].t < renderT - 500) s.shift();
-};
-
-// Dónde está AHORA otro jugador (para los choques), a partir de su último dato.
-// Se dibuja un poco en el pasado para que sea fluido, pero choca donde está de verdad.
-const estimatePresent = (p, tickRate) => {
-  const s = p.snaps || (p.snaps = []);
-  const lastS = s[s.length - 1];
-  if (!lastS) {
-    p.cx = p.x;
-    p.cy = p.y;
-    p.cvx = p.vx || 0;
-    p.cvy = p.vy || 0;
-    return;
-  }
-  const ticks = (Math.min(Math.max(Date.now() - lastS.t, 0), 150) / 1000) * tickRate;
-  p.cx = lastS.x + lastS.vx * ticks;
-  p.cy = lastS.y + lastS.vy * ticks;
-  p.cvx = lastS.vx;
-  p.cvy = lastS.vy;
 };
 
 // Posición de saque: cada jugador del equipo en una altura distinta
@@ -636,9 +635,7 @@ function renderGame(
   particles,
   fx,
   myUid,
-  meDraw,
-  kickTeam,
-  ownerId
+  kickTeam
 ) {
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.save();
@@ -669,8 +666,8 @@ function renderGame(
   const ps = shadowSprite(PLAYER_R);
   for (const id in players) {
     const p = players[id];
-    const x = id === myUid ? meDraw.x : p.x;
-    const y = id === myUid ? meDraw.y : p.y;
+    const x = p.dx ?? p.x;
+    const y = p.dy ?? p.y;
     drawSprite(ctx, ps, x + 2, y + 4);
   }
   drawSprite(ctx, shadowSprite(BALL_R), ball.x + 2, ball.y + 4);
@@ -695,8 +692,8 @@ function renderGame(
   for (const id in players) {
     const p = players[id];
     const isMe = id === myUid;
-    const x = isMe ? meDraw.x : p.x;
-    const y = isMe ? meDraw.y : p.y;
+    const x = p.dx ?? p.x;
+    const y = p.dy ?? p.y;
 
     if (isMe) {
       ctx.beginPath();
@@ -732,16 +729,6 @@ function renderGame(
   ctx.globalAlpha = 1;
   ctx.restore();
 
-  // Quién controla el balón ahora mismo (arriba a la izquierda)
-  if (ownerId) {
-    const owner = players[ownerId];
-    const label = `⚽ ${owner ? owner.name || "Crack" : "nadie"}`;
-    const n = nameSprite(label, ownerId === myUid);
-    ctx.globalAlpha = 0.8;
-    ctx.drawImage(n.c, 6, 6, n.w, n.h);
-    ctx.globalAlpha = 1;
-  }
-
   // Destello de gol
   if (fx.flash > 0) {
     ctx.fillStyle = fx.flashColor;
@@ -754,20 +741,83 @@ function renderGame(
 // Balón "fijo" para cuando está atrapado entre el jugador y la pared
 const stuckBall = { x: 0, y: 0, vx: 0, vy: 0, r: BALL_R, inv: 0 };
 
-// Disco temporal para no crear objetos nuevos en cada choque
-const tmpDisc = { x: 0, y: 0, vx: 0, vy: 0, r: PLAYER_R, inv: PLAYER_INV_MASS };
-const asDisc = (p, inv = PLAYER_INV_MASS) => {
-  tmpDisc.inv = inv;
-  tmpDisc.x = p.cx ?? p.x;
-  tmpDisc.y = p.cy ?? p.y;
-  tmpDisc.vx = p.cvx ?? p.vx ?? 0;
-  tmpDisc.vy = p.cvy ?? p.vy ?? 0;
-  return tmpDisc;
-};
+// Física de un jugador según sus teclas (igual en el host y en tu pantalla)
+function stepPlayer(p, bits) {
+  let ix = 0;
+  let iy = 0;
+  if (bits & BIT_UP) iy -= 1;
+  if (bits & BIT_DOWN) iy += 1;
+  if (bits & BIT_LEFT) ix -= 1;
+  if (bits & BIT_RIGHT) ix += 1;
+  if (ix !== 0 && iy !== 0) {
+    ix *= Math.SQRT1_2;
+    iy *= Math.SQRT1_2;
+  }
+  const accel = bits & BIT_KICK ? PLAYER_ACCEL_KICKING : PLAYER_ACCEL;
+  p.vx += ix * accel;
+  p.vy += iy * accel;
+  p.x += p.vx;
+  p.y += p.vy;
+  p.vx *= PLAYER_DAMPING;
+  p.vy *= PLAYER_DAMPING;
+}
 
-// ----------------------------------------------------
-// App
-// ----------------------------------------------------
+// Saque de centro: cada uno en su campo y solo el equipo que saca
+// puede entrar en el círculo central (como en Haxball)
+function applyKickoffLimits(p, km) {
+  if (!km.kickoffActive) return;
+  const kicking = p.team === (km.kickoffTeam || "red");
+  const dx = p.x - CX;
+  const dy = p.y - CY;
+  const d = Math.hypot(dx, dy) || 0.001;
+  const wrongSide = p.team === "red" ? p.x > CX - PLAYER_R : p.x < CX + PLAYER_R;
+  if (kicking) {
+    if (wrongSide && d > CENTER_R - PLAYER_R) {
+      if (d < CENTER_R + PLAYER_R) {
+        p.x = CX + (dx / d) * (CENTER_R - PLAYER_R);
+        p.y = CY + (dy / d) * (CENTER_R - PLAYER_R);
+      } else {
+        p.x = p.team === "red" ? CX - PLAYER_R : CX + PLAYER_R;
+      }
+      p.vx *= 0.5;
+      p.vy *= 0.5;
+    }
+  } else {
+    if (wrongSide) {
+      p.x = p.team === "red" ? CX - PLAYER_R : CX + PLAYER_R;
+      p.vx = 0;
+    }
+    const d2 = Math.hypot(p.x - CX, p.y - CY) || 0.001;
+    if (d2 < CENTER_R + PLAYER_R) {
+      p.x = CX + ((p.x - CX) / d2) * (CENTER_R + PLAYER_R);
+      p.y = CY + ((p.y - CY) / d2) * (CENTER_R + PLAYER_R);
+      p.vx *= 0.5;
+      p.vy *= 0.5;
+    }
+  }
+}
+
+// Límites del canvas (los jugadores pueden salir de las líneas, como en Haxball)
+function clampToCanvas(p) {
+  if (p.x < PLAYER_R) {
+    p.x = PLAYER_R;
+    p.vx = 0;
+  } else if (p.x > CW - PLAYER_R) {
+    p.x = CW - PLAYER_R;
+    p.vx = 0;
+  }
+  if (p.y < PLAYER_R) {
+    p.y = PLAYER_R;
+    p.vy = 0;
+  } else if (p.y > CH - PLAYER_R) {
+    p.y = CH - PLAYER_R;
+    p.vy = 0;
+  }
+}
+
+// Disco temporal para no crear objetos nuevos en cada choque
+const tmpDisc = { x: 0, y: 0, vx: 0, vy: 0, r: PLAYER_R, inv: 0 };
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [playerName, setPlayerName] = useState("");
@@ -792,12 +842,18 @@ export default function App() {
   const canvasRef = useRef(null);
   const keys = useRef({});
   const kickHoldUntil = useRef(0);
+  const kickPresses = useRef(0); // veces que he pulsado chutar
 
   // Estado del juego en refs (no re-renderiza React)
-  const players = useRef({});
-  const posCache = useRef({}); // últimas posiciones recibidas, por si llegan antes que el jugador
-  const ball = useRef({ x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [] });
-  const ballNet = useRef(null);
+  // ents: jugadores. En el host se calculan aquí; en los demás se dibujan
+  // a partir de las fotos del host (y el tuyo propio se predice para que responda al momento).
+  const ents = useRef({});
+  const info = useRef({}); // nombre, equipo y sid de cada jugador
+  const sidMap = useRef({}); // sid → uid
+  const inputs = useRef({}); // (host) teclas de cada jugador
+  const ball = useRef({ x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] });
+  const hostMe = useRef(null); // (invitado) dónde me tiene el host
+  const lastStateRecv = useRef(0); // (invitado) última foto recibida del host
   const particles = useRef([]);
   const fx = useRef({ shake: 0, flash: 0, flashColor: RED });
   const isHost = useRef(false);
@@ -812,15 +868,10 @@ export default function App() {
   const goalOpen = useRef(false); // hay un gol marcado esperando el saque
   const kickoffTimer = useRef(null);
   const kickoffFn = useRef(null);
-  // Dueño del balón: quien lo tocó el último lo calcula y lo envía a los demás.
-  // c = número de "cambio de dueño" para ordenar los mensajes.
-  const own = useRef({ c: 0, o: null });
   const playerIds = useRef([]);
   const listSig = useRef("");
-  const forceSync = useRef(false);
   const metaNow = useRef({}); // último estado de la sala (para leerlo en la física)
-  const touchRef = useRef({ last: null, prev: null }); // últimos que tocaron el balón
-  const lastBallRecv = useRef(0); // cuándo llegó el último dato del dueño del balón
+  const touchRef = useRef({ last: null, prev: null }); // (host) últimos que tocaron el balón
 
   const amHost = !!user && meta?.hostId === user.uid;
   const speed = meta?.speed || DEFAULT_SPEED;
@@ -844,31 +895,32 @@ export default function App() {
     }
   };
 
-  const rankInTeam = (uid, team) =>
-    Object.keys(players.current)
-      .filter((id) => players.current[id].team === team)
+  const rankInTeam = (id, team) =>
+    Object.keys(info.current)
+      .filter((k) => info.current[k].team === team)
       .sort()
-      .indexOf(uid);
+      .indexOf(id);
 
-  const resetForKickoff = (uid) => {
-    const me = players.current[uid];
-    if (me) {
-      const pos = spawnPos(me.team, Math.max(0, rankInTeam(uid, me.team)));
-      me.x = me.px = pos.x;
-      me.y = me.py = pos.y;
-      me.vx = 0;
-      me.vy = 0;
-    }
+  const placeAtSpawn = (id) => {
+    const p = ents.current[id];
+    const inf = info.current[id];
+    if (!p || !inf) return;
+    const pos = spawnPos(inf.team, Math.max(0, rankInTeam(id, inf.team)));
+    p.x = p.px = pos.x;
+    p.y = p.py = pos.y;
+    p.vx = 0;
+    p.vy = 0;
+    p.snaps = [];
+  };
+
+  const resetBall = () => {
     const b = ball.current;
     b.x = b.px = CX;
     b.y = b.py = CY;
     b.vx = 0;
     b.vy = 0;
     b.trail = [];
-    ballNet.current = null;
-    goalPending.current = false;
-    forceSync.current = true;
-    lastBallRecv.current = Date.now(); // margen tras el saque
+    b.snaps = [];
   };
 
   // 1. Autenticación anónima
@@ -898,28 +950,29 @@ export default function App() {
     const base = `rooms/${roomId}`;
     const baseRef = ref(db, base);
 
-    players.current = {};
-    posCache.current = {};
-    ballNet.current = null;
+    ents.current = {};
+    info.current = {};
+    sidMap.current = {};
+    inputs.current = {};
+    hostMe.current = null;
+    ball.current = { x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] };
     lastKickoff.current = null;
     lastGoalAt.current = null;
     lastKickCount.current = null;
     hostIdRef.current = null;
+    isHost.current = false;
     goalPending.current = false;
     goalOpen.current = false;
-    own.current = { c: 0, o: null };
     playerIds.current = [];
     listSig.current = "";
     metaNow.current = {};
     touchRef.current = { last: null, prev: null };
-    lastBallRecv.current = Date.now(); // margen al entrar en la sala
+    lastStateRecv.current = Date.now(); // margen al entrar en la sala
 
     // Saque de centro (lo hace el host). Saca el equipo que ha encajado.
     const doKickoff = (extraMeta = {}, extraPatch = {}) => {
       kickoffTimer.current = null;
       if (!isHost.current) return;
-      const c = own.current.c + 1;
-      own.current = { c, o: uid };
       const last = metaNow.current.lastGoalTeam;
       const kickoffTeam = last === "red" ? "blue" : last === "blue" ? "red" : "red";
       const patch = {};
@@ -932,8 +985,6 @@ export default function App() {
       }).forEach(([k, v]) => {
         patch[`meta/${k}`] = v;
       });
-      patch.ball = encBall({ x: CX, y: CY, vx: 0, vy: 0, k: ball.current.k }, c, uid);
-      patch.touch = null;
       Object.assign(patch, extraPatch);
       update(baseRef, patch).catch(() => {});
     };
@@ -948,19 +999,43 @@ export default function App() {
       }
     };
 
+    // Paso a ser el host: sigo el partido desde lo último que veía
+    const becomeHost = () => {
+      for (const id in ents.current) {
+        const p = ents.current[id];
+        p.px = p.x;
+        p.py = p.y;
+        p.kickReady = true;
+        p.kickPending = 0;
+        p.snaps = [];
+      }
+      const b = ball.current;
+      b.px = b.x;
+      b.py = b.y;
+      b.snaps = [];
+      touchRef.current = { last: null, prev: null };
+      goalPending.current = false;
+    };
+
     // Al conectar (o reconectar): registrarse y borrarse al desconectar
     const unsubConn = onValue(ref(db, ".info/connected"), (snap) => {
       setOnline(snap.val() === true);
       if (snap.val() !== true) return;
       onDisconnect(baseRef).update({
         [`players/${uid}`]: null,
-        [`pos/${uid}`]: null,
+        [`in/${uid}`]: null,
       });
-      const me = players.current[uid];
-      if (me) {
+      const mine = info.current[uid];
+      const me = ents.current[uid];
+      if (mine && me) {
         update(baseRef, {
-          [`players/${uid}`]: { name: me.name, team: me.team },
-          [`pos/${uid}`]: encPos(me),
+          [`players/${uid}`]: {
+            name: mine.name,
+            team: mine.team,
+            sid: sidOf(uid),
+            sx: r1(me.x),
+            sy: r1(me.y),
+          },
         }).catch(() => {});
       }
     });
@@ -975,8 +1050,13 @@ export default function App() {
       setMeta(m);
       metaNow.current = m;
       setVersionWarn((m.v || 0) !== GAME_VERSION);
+      const wasHost = isHost.current;
+      const hostChanged = hostIdRef.current !== null && hostIdRef.current !== m.hostId;
       hostIdRef.current = m.hostId;
       isHost.current = m.hostId === uid;
+      if (isHost.current && !wasHost) becomeHost();
+      // Nuevo host: le damos un momento antes de pensar que se ha caído
+      if (hostChanged || wasHost) lastStateRecv.current = Date.now();
       speedRef.current = m.speed || DEFAULT_SPEED;
       scoresRef.current = { red: m.scoreRed || 0, blue: m.scoreBlue || 0 };
       goalOpen.current = (m.goalAt || 0) > (m.kickoff || 0);
@@ -1011,48 +1091,70 @@ export default function App() {
         );
       }
 
-      // Saque de centro
+      // Saque de centro: el host recoloca a todos; los demás, a sí mismos
       const kickoff = m.kickoff || 0;
       if (lastKickoff.current === null) {
         lastKickoff.current = kickoff;
       } else if (kickoff !== lastKickoff.current) {
         lastKickoff.current = kickoff;
-        resetForKickoff(uid);
+        if (isHost.current) {
+          for (const id in ents.current) placeAtSpawn(id);
+          touchRef.current = { last: null, prev: null };
+        } else {
+          placeAtSpawn(uid);
+          hostMe.current = null;
+          for (const id in ents.current) ents.current[id].snaps = [];
+        }
+        resetBall();
+        goalPending.current = false;
       }
       ensureHost();
     });
 
-    // Lista de jugadores (nombre y equipo): solo cambia al entrar, salir o cambiar de equipo
+    // Lista de jugadores (nombre, equipo y dónde aparecen)
     const unsubPlayers = onValue(ref(db, `${base}/players`), (snap) => {
       const data = snap.val() || {};
-      const map = players.current;
+      const map = ents.current;
 
       for (const id in data) {
-        const info = data[id];
+        const d = data[id];
+        const prevTeam = info.current[id]?.team;
+        info.current[id] = { name: d.name, team: d.team, sid: d.sid || sidOf(id) };
+        sidMap.current[d.sid || sidOf(id)] = id;
         let p = map[id];
+        const sx = Number.isFinite(d.sx) ? d.sx : spawnPos(d.team, 0).x;
+        const sy = Number.isFinite(d.sy) ? d.sy : spawnPos(d.team, 0).y;
         if (!p) {
-          const cached = posCache.current[id];
-          const c = cached || spawnPos(info.team, 0);
           p = map[id] = {
-            x: c.x,
-            y: c.y,
-            px: c.x,
-            py: c.y,
-            vx: c.vx || 0,
-            vy: c.vy || 0,
-            snaps: cached
-              ? [{ t: cached.lt, x: c.x, y: c.y, vx: c.vx, vy: c.vy }]
-              : [],
-            isKicking: !!c.k,
+            x: sx,
+            y: sy,
+            px: sx,
+            py: sy,
+            vx: 0,
+            vy: 0,
+            r: PLAYER_R,
+            inv: PLAYER_INV_MASS,
+            snaps: [],
+            isKicking: false,
             kickReady: true,
-            posInit: !!posCache.current[id],
+            kickPending: 0,
+            lastKc: null,
           };
+        } else if (prevTeam && prevTeam !== d.team && (isHost.current || id === uid)) {
+          // Ha cambiado de equipo: a su sitio nuevo
+          p.x = p.px = sx;
+          p.y = p.py = sy;
+          p.vx = p.vy = 0;
         }
-        p.name = info.name;
-        p.team = info.team;
+        p.name = d.name;
+        p.team = d.team;
       }
       for (const id in map) {
-        if (!data[id] && id !== uid) delete map[id];
+        if (!data[id]) {
+          delete map[id];
+          delete info.current[id];
+          delete inputs.current[id];
+        }
       }
 
       // Número de cada jugador dentro de su equipo
@@ -1075,81 +1177,64 @@ export default function App() {
         setPlayersList(list);
       }
       ensureHost();
-
-      // Si el dueño del balón se ha ido, el host se lo queda
-      const o = own.current.o;
-      if (isHost.current && o && o !== uid && !data[o]) {
-        own.current = { c: own.current.c + 1, o: uid };
-        ballNet.current = null;
-        forceSync.current = true;
-      }
     });
 
-    // Posiciones: solo llega el jugador que ha cambiado, no la lista entera
-    const posRef = ref(db, `${base}/pos`);
-    const onPos = (snap) => {
+    // Teclas de cada jugador (las usa el host)
+    const inRef = ref(db, `${base}/in`);
+    const onInput = (snap) => {
       const id = snap.key;
-      const v = decPos(snap.val());
+      if (id === uid) return;
+      const v = decInput(snap.val());
       if (!v) return;
-      if (id !== uid) v.lt = v.t ? toLocalTime(id, v.t) : Date.now();
-      posCache.current[id] = v;
-      const p = players.current[id];
-      if (!p) return;
-      if (id === uid) {
-        // Mi posición la controlo yo; solo la uso al entrar
-        if (!p.posInit) {
-          p.x = p.px = v.x;
-          p.y = p.py = v.y;
-          p.posInit = true;
-        }
-        return;
+      inputs.current[id] = { bits: v.bits, at: Date.now() };
+      const p = ents.current[id];
+      if (p) {
+        // Cada pulsación de chutar cuenta aunque haya sido muy rápida
+        if (p.lastKc !== null && v.kc > p.lastKc) p.kickPending = 10;
+        p.lastKc = v.kc;
       }
-      const s = p.snaps;
-      const lastS = s[s.length - 1];
-      if (lastS && v.lt <= lastS.t) return; // llegó desordenado
-      s.push({ t: v.lt, x: v.x, y: v.y, vx: v.vx, vy: v.vy });
-      if (s.length > 20) s.shift();
-      p.isKicking = v.k;
     };
-    const unsubPosAdd = onChildAdded(posRef, onPos);
-    const unsubPosChg = onChildChanged(posRef, onPos);
+    const unsubInAdd = onChildAdded(inRef, onInput);
+    const unsubInChg = onChildChanged(inRef, onInput);
 
-    const unsubBall = onValue(ref(db, `${base}/ball`), (snap) => {
-      const v = decBall(snap.val());
+    // Fotos del partido que manda el host (las usan los demás)
+    const unsubState = onValue(ref(db, `${base}/state`), (snap) => {
+      if (isHost.current) return;
+      const v = decState(snap.val());
       if (!v) return;
+      const lt = toLocalTime(`host:${hostIdRef.current}`, v.t);
+      lastStateRecv.current = Date.now();
 
-      // Sonido de chut de los demás
+      const b = ball.current;
+      const bs = b.snaps;
+      if (!bs.length || lt > bs[bs.length - 1].t) {
+        bs.push({ t: lt, x: v.ball.x, y: v.ball.y, vx: v.ball.vx, vy: v.ball.vy });
+        if (bs.length > 20) bs.shift();
+      }
+
+      // Chut de alguien: sonido y chispas
       if (lastKickCount.current !== null && v.k > lastKickCount.current) {
-        if (v.o !== uid && performance.now() - lastLocalKick.current > 300) {
-          sounds.playKick();
-        }
+        if (performance.now() - lastLocalKick.current > 300) sounds.playKick();
+        spawnParticles(v.ball.x, v.ball.y, "#ffffff", 6, 0.8);
       }
-      lastKickCount.current = Math.max(lastKickCount.current || 0, v.k);
-      ball.current.k = Math.max(ball.current.k || 0, v.k);
+      lastKickCount.current = v.k;
 
-      // Solo acepto mensajes del dueño más reciente
-      const cur = own.current;
-      const newer = v.c > cur.c || (v.c === cur.c && (v.o || "") >= (cur.o || ""));
-      if (!newer) return;
-      const wasOwner = cur.o === uid;
-      own.current = { c: v.c, o: v.o };
-      if (v.o === uid) {
-        if (!wasOwner) {
-          // Me han pasado el balón (otro jugador ha minimizado la pestaña)
-          const b = ball.current;
-          b.x = b.px = v.x;
-          b.y = b.py = v.y;
-          b.vx = v.vx;
-          b.vy = v.vy;
-          forceSync.current = true;
+      for (const sp of v.players) {
+        const id = sidMap.current[sp.sid];
+        const p = id && ents.current[id];
+        if (!p) continue;
+        if (id === uid) {
+          hostMe.current = { t: lt, x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy };
+          continue;
         }
-        ballNet.current = null;
-        return;
+        const s = p.snaps;
+        if (!s.length || lt > s[s.length - 1].t) {
+          s.push({ t: lt, x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy });
+          if (s.length > 20) s.shift();
+        }
+        p.isKicking = sp.k;
+        p.staleHost = sp.s;
       }
-      // momento real del dato, en mi reloj
-      v.lt = v.t ? toLocalTime(v.o, v.t) : Date.now();
-      lastBallRecv.current = Date.now();
-      ballNet.current = v;
     });
 
     const unsubMsgs = onValue(
@@ -1163,18 +1248,12 @@ export default function App() {
       }
     );
 
-    // Quién tocó el balón el último y el penúltimo (para goles y asistencias)
-    const unsubTouch = onValue(ref(db, `${base}/touch`), (snap) => {
-      const t = snap.val() || {};
-      touchRef.current = { last: t.last || null, prev: t.prev || null };
-    });
-
     // Estadísticas de la partida
     const unsubStats = onValue(ref(db, `${base}/stats`), (snap) => {
       setStats(snap.val() || {});
     });
 
-    // Tareas del host: fin del tiempo / prórroga y marcar la sala como activa
+    // Tareas del host: fin del tiempo / prórroga, lista pública y sala activa
     let lastActiveMark = 0;
     let lastLobbyMark = 0;
     let lastLobbyKey = "";
@@ -1189,7 +1268,7 @@ export default function App() {
       if (m.isPublic) {
         const entry = {
           name: m.name || `Sala ${roomId}`,
-          host: players.current[uid]?.name || "?",
+          host: info.current[uid]?.name || "?",
           count: playerIds.current.length,
           max: MAX_PLAYERS,
           scoreRed: m.scoreRed || 0,
@@ -1243,15 +1322,12 @@ export default function App() {
       }
     }, 500);
 
-    // Si minimizo la pestaña teniendo el balón, se lo paso a otro
+    // Si el host minimiza la pestaña, el partido se pararía: pasa el mando a otro
     const onVisibility = () => {
-      if (!document.hidden || own.current.o !== uid) return;
-      const others = playerIds.current.filter((id) => id !== uid);
+      if (!document.hidden || !isHost.current) return;
+      const others = playerIds.current.filter((id) => id !== uid).sort();
       if (!others.length) return;
-      const o = others.includes(hostIdRef.current) ? hostIdRef.current : others[0];
-      const c = own.current.c + 1;
-      own.current = { c, o };
-      update(baseRef, { ball: encBall(ball.current, c, o, true) }).catch(() => {});
+      update(ref(db, `${base}/meta`), { hostId: others[0] }).catch(() => {});
     };
     document.addEventListener("visibilitychange", onVisibility);
 
@@ -1259,11 +1335,10 @@ export default function App() {
       unsubConn();
       unsubMeta();
       unsubPlayers();
-      unsubPosAdd();
-      unsubPosChg();
-      unsubBall();
+      unsubInAdd();
+      unsubInChg();
+      unsubState();
       unsubMsgs();
-      unsubTouch();
       unsubStats();
       clearInterval(hostTimer);
       document.removeEventListener("visibilitychange", onVisibility);
@@ -1273,7 +1348,7 @@ export default function App() {
       onDisconnect(baseRef).cancel();
       update(baseRef, {
         [`players/${uid}`]: null,
-        [`pos/${uid}`]: null,
+        [`in/${uid}`]: null,
       }).catch(() => {});
     };
   }, [user, roomId]);
@@ -1315,7 +1390,7 @@ export default function App() {
   // 4. Teclado
   useEffect(() => {
     const isTyping = () =>
-      ["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName);
+      ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
     const blocked = ["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"];
     const kickKeys = ["Space", "KeyX"];
 
@@ -1323,8 +1398,9 @@ export default function App() {
       if (isTyping()) return;
       if (blocked.includes(e.code)) e.preventDefault();
       keys.current[e.code] = true;
-      if (kickKeys.includes(e.code)) {
+      if (kickKeys.includes(e.code) && !e.repeat) {
         kickHoldUntil.current = performance.now() + KICK_HOLD_MS;
+        kickPresses.current += 1;
       }
     };
     const up = (e) => {
@@ -1353,47 +1429,30 @@ export default function App() {
     const field = buildField();
     const uid = user.uid;
     const base = `rooms/${roomId}`;
-    const baseRef = ref(db, base);
-    const meDraw = { x: 0, y: 0 };
 
     let animId;
     let last = performance.now();
     let acc = 0;
     let lastSync = 0;
-    let lastPosStr = "";
-    let lastBallStr = "";
-    let lastHeartbeat = 0;
+    let lastInputStr = "";
+    let lastInputSent = 0;
+    let lastHostClaim = 0;
+    let myLastKc = kickPresses.current;
 
-    // Pide ser el dueño del balón (lo he tocado yo)
-    const claimBall = () => {
-      if (own.current.o === uid) return;
-      own.current = { c: own.current.c + 1, o: uid };
-      ballNet.current = null;
-      forceSync.current = true;
+    // Teclas que estoy pulsando ahora mismo
+    const readBits = (now) => {
+      const k = keys.current;
+      let bits = 0;
+      if (k.KeyW || k.ArrowUp) bits |= BIT_UP;
+      if (k.KeyS || k.ArrowDown) bits |= BIT_DOWN;
+      if (k.KeyA || k.ArrowLeft) bits |= BIT_LEFT;
+      if (k.KeyD || k.ArrowRight) bits |= BIT_RIGHT;
+      if (k.Space || k.KeyX || now < kickHoldUntil.current) bits |= BIT_KICK;
+      return bits;
     };
 
-    // Si el dueño del balón deja de enviar (se le ha caído internet, se ha ido...)
-    // durante más de 1 s, el balón se queda sin nadie que mande y cada pantalla
-    // lo vería en un sitio distinto. Entonces lo coge un jugador concreto
-    // (el de uid más bajo, sin contar al dueño), el mismo en todas las pantallas.
-    const checkStaleOwner = () => {
-      const o = own.current.o;
-      if (o === uid) return;
-      if (Date.now() - lastBallRecv.current < 1000) return;
-      const candidates = playerIds.current.filter((id) => id !== o).sort();
-      if (candidates[0] === uid) {
-        claimBall();
-        lastBallRecv.current = Date.now();
-      }
-    };
-
-    // Apunta quién ha tocado el balón (solo cuando cambia de jugador)
-    const markTouch = () => {
-      const t = touchRef.current;
-      if (t.last === uid) return;
-      touchRef.current = { last: uid, prev: t.last };
-      update(baseRef, { touch: touchRef.current }).catch(() => {});
-    };
+    const nameOf = (id) => info.current[id]?.name || "Alguien";
+    const teamOf = (id) => info.current[id]?.team;
 
     // Primer toque del saque: se acaban las restricciones de campo
     const endKickoff = () => {
@@ -1402,10 +1461,14 @@ export default function App() {
       update(ref(db, `${base}/meta`), { kickoffActive: false }).catch(() => {});
     };
 
-    const nameOf = (id) => players.current[id]?.name || "Alguien";
-    const teamOf = (id) => players.current[id]?.team;
+    // (host) apunta quién ha tocado el balón, para goles y asistencias
+    const touched = (id) => {
+      const t = touchRef.current;
+      if (t.last !== id) touchRef.current = { last: id, prev: t.last };
+      endKickoff();
+    };
 
-    // Solo el dueño del balón anuncia los goles
+    // (host) gol: marcador, goleador y si se acaba el partido
     const reportGoal = (team) => {
       goalPending.current = true;
       const m = metaNow.current;
@@ -1413,29 +1476,27 @@ export default function App() {
       s[team] += 1;
       scoresRef.current = s;
 
-      // Quién ha marcado
       const patch = {};
-      const { last, prev } = touchRef.current;
+      const { last: lastT, prev } = touchRef.current;
       let banner = `¡GOOOL DEL EQUIPO ${team === "red" ? "ROJO" : "AZUL"}!`;
-      if (last && teamOf(last) === team) {
-        banner = `⚽ ¡Gol de ${nameOf(last)}!`;
-        patch[`stats/${last}/g`] = increment(1);
-        patch[`stats/${last}/n`] = nameOf(last);
-        patch[`stats/${last}/t`] = team;
-        if (prev && prev !== last && teamOf(prev) === team) {
+      if (lastT && teamOf(lastT) === team) {
+        banner = `⚽ ¡Gol de ${nameOf(lastT)}!`;
+        patch[`stats/${lastT}/g`] = increment(1);
+        patch[`stats/${lastT}/n`] = nameOf(lastT);
+        patch[`stats/${lastT}/t`] = team;
+        if (prev && prev !== lastT && teamOf(prev) === team) {
           banner += ` (asist. ${nameOf(prev)})`;
           patch[`stats/${prev}/a`] = increment(1);
           patch[`stats/${prev}/n`] = nameOf(prev);
           patch[`stats/${prev}/t`] = team;
         }
-      } else if (last) {
-        banner = `🙈 Autogol de ${nameOf(last)}`;
-        patch[`stats/${last}/og`] = increment(1);
-        patch[`stats/${last}/n`] = nameOf(last);
-        patch[`stats/${last}/t`] = teamOf(last) || "";
+      } else if (lastT) {
+        banner = `🙈 Autogol de ${nameOf(lastT)}`;
+        patch[`stats/${lastT}/og`] = increment(1);
+        patch[`stats/${lastT}/n`] = nameOf(lastT);
+        patch[`stats/${lastT}/t`] = teamOf(lastT) || "";
       }
 
-      // ¿Se acaba el partido? (límite de goles o gol de oro en la prórroga)
       const limit = m.scoreLimit || 0;
       const over = m.overtime || (limit > 0 && s[team] >= limit);
 
@@ -1448,135 +1509,60 @@ export default function App() {
         patch["meta/phase"] = "over";
         patch["meta/winner"] = team;
       }
-      update(baseRef, patch).catch((e) => console.error(e));
+      update(ref(db, base), patch).catch((e) => console.error(e));
     };
 
-    // Predicción del balón del dueño, con rebotes en las paredes
-    const pred = { x: 0, y: 0, vx: 0, vy: 0 };
-    const predictNet = (n) => {
-      // Ticks transcurridos desde que el dueño lo envió (con decimales, sin saltos)
-      const total = Math.max(
-        0,
-        Math.min(((Date.now() - n.lt) / 1000) * 60 * speedRef.current, 15)
-      );
-      const steps = Math.floor(total);
-      const frac = total - steps;
-      pred.x = n.x;
-      pred.y = n.y;
-      pred.vx = n.vx;
-      pred.vy = n.vy;
-      for (let i = 0; i < steps; i++) {
-        pred.x += pred.vx;
-        pred.y += pred.vy;
-        pred.vx *= BALL_DAMPING;
-        pred.vy *= BALL_DAMPING;
-        ballWalls(pred);
-      }
-      pred.x += pred.vx * frac;
-      pred.y += pred.vy * frac;
-      ballWalls(pred);
-      return pred;
-    };
-
-    // Un "tick" de física (60 por segundo a velocidad 1)
-    const tick = (now) => {
+    // ---------- HOST: calcula todo el partido ----------
+    const hostTick = (bits) => {
+      const all = ents.current;
+      const inf = info.current;
       const b = ball.current;
-      const all = players.current;
-      const me = all[uid];
+      const km = metaNow.current;
+      const nowMs = Date.now();
+      const ids = [];
+      for (const id in all) if (inf[id]) ids.push(id);
+
       b.px = b.x;
       b.py = b.y;
 
-      // --- Mi jugador ---
-      if (me) {
-        me.px = me.x;
-        me.py = me.y;
-        const k = keys.current;
-        let ix = 0;
-        let iy = 0;
-        if (k.KeyW || k.ArrowUp) iy -= 1;
-        if (k.KeyS || k.ArrowDown) iy += 1;
-        if (k.KeyA || k.ArrowLeft) ix -= 1;
-        if (k.KeyD || k.ArrowRight) ix += 1;
-        if (ix !== 0 && iy !== 0) {
-          ix *= Math.SQRT1_2;
-          iy *= Math.SQRT1_2;
-        }
-
-        const kickHeld = !!(k.Space || k.KeyX) || now < kickHoldUntil.current;
-        if (!kickHeld) me.kickReady = true;
-        me.isKicking = kickHeld;
-
-        const accel = kickHeld ? PLAYER_ACCEL_KICKING : PLAYER_ACCEL;
-        me.vx += ix * accel;
-        me.vy += iy * accel;
-        me.x += me.vx;
-        me.y += me.vy;
-        me.vx *= PLAYER_DAMPING;
-        me.vy *= PLAYER_DAMPING;
-
-        me.r = PLAYER_R;
-        me.inv = PLAYER_INV_MASS;
-        for (const id in all) {
-          if (id !== uid) collide(me, asDisc(all[id]), REST_PLAYER_PLAYER);
-        }
-        for (let i = 0; i < POST_DISCS.length; i++) {
-          collide(me, POST_DISCS[i], REST_POST);
-        }
-
-        // Saque de centro: cada uno en su campo y solo el equipo que saca
-        // puede entrar en el círculo central (como en Haxball)
-        const km = metaNow.current;
-        if (km.kickoffActive) {
-          const kicking = me.team === (km.kickoffTeam || "red");
-          const dx = me.x - CX;
-          const dy = me.y - CY;
-          const d = Math.hypot(dx, dy) || 0.001;
-          const wrongSide = me.team === "red" ? me.x > CX - PLAYER_R : me.x < CX + PLAYER_R;
-          if (kicking) {
-            // Puede estar dentro del círculo; fuera de él, solo en su campo
-            if (wrongSide && d > CENTER_R - PLAYER_R) {
-              if (d < CENTER_R + PLAYER_R) {
-                me.x = CX + (dx / d) * (CENTER_R - PLAYER_R);
-                me.y = CY + (dy / d) * (CENTER_R - PLAYER_R);
-              } else {
-                me.x = me.team === "red" ? CX - PLAYER_R : CX + PLAYER_R;
-              }
-              me.vx *= 0.5;
-              me.vy *= 0.5;
-            }
-          } else {
-            if (wrongSide) {
-              me.x = me.team === "red" ? CX - PLAYER_R : CX + PLAYER_R;
-              me.vx = 0;
-            }
-            const d2 = Math.hypot(me.x - CX, me.y - CY) || 0.001;
-            if (d2 < CENTER_R + PLAYER_R) {
-              me.x = CX + ((me.x - CX) / d2) * (CENTER_R + PLAYER_R);
-              me.y = CY + ((me.y - CY) / d2) * (CENTER_R + PLAYER_R);
-              me.vx *= 0.5;
-              me.vy *= 0.5;
-            }
-          }
-        }
-
-        // Límites (los jugadores pueden salir de las líneas, como en Haxball)
-        if (me.x < PLAYER_R) {
-          me.x = PLAYER_R;
-          me.vx = 0;
-        } else if (me.x > CW - PLAYER_R) {
-          me.x = CW - PLAYER_R;
-          me.vx = 0;
-        }
-        if (me.y < PLAYER_R) {
-          me.y = PLAYER_R;
-          me.vy = 0;
-        } else if (me.y > CH - PLAYER_R) {
-          me.y = CH - PLAYER_R;
-          me.vy = 0;
-        }
+      // Mis propias pulsaciones de chutar
+      const me = all[uid];
+      if (me && kickPresses.current > myLastKc) {
+        me.kickPending = 10;
+        myLastKc = kickPresses.current;
       }
 
-      // --- Balón: todos lo simulan; el dueño manda ---
+      // Movimiento de cada jugador según sus teclas
+      for (const id of ids) {
+        const p = all[id];
+        p.px = p.x;
+        p.py = p.y;
+        let pb = 0;
+        if (id === uid) pb = bits;
+        else {
+          const inp = inputs.current[id];
+          // Si no llegan sus teclas en 1,5 s (se ha caído), se queda quieto
+          if (inp && nowMs - inp.at < 1500) pb = inp.bits;
+        }
+        p.isKicking = !!(pb & BIT_KICK);
+        if (!p.isKicking && !(p.kickPending > 0)) p.kickReady = true;
+        stepPlayer(p, pb);
+      }
+
+      // Choques entre jugadores
+      for (let i = 0; i < ids.length; i++) {
+        for (let j = i + 1; j < ids.length; j++) {
+          collide(all[ids[i]], all[ids[j]], REST_PLAYER_PLAYER);
+        }
+      }
+      for (const id of ids) {
+        const p = all[id];
+        for (let i = 0; i < POST_DISCS.length; i++) collide(p, POST_DISCS[i], REST_POST);
+        applyKickoffLimits(p, km);
+        clampToCanvas(p);
+      }
+
+      // Balón
       b.x += b.vx;
       b.y += b.vy;
       b.vx *= BALL_DAMPING;
@@ -1584,91 +1570,111 @@ export default function App() {
       b.r = BALL_R;
       b.inv = BALL_INV_MASS;
 
-      let touched = false;
-      if (me) {
-        // Chut: una vez por pulsación, como en Haxball
-        if (me.isKicking && me.kickReady) {
-          const dx = b.x - me.x;
-          const dy = b.y - me.y;
+      for (const id of ids) {
+        const p = all[id];
+        // Chut: al mantener la tecla o justo después de pulsarla
+        if ((p.isKicking && p.kickReady) || p.kickPending > 0) {
+          const dx = b.x - p.x;
+          const dy = b.y - p.y;
           const d = Math.hypot(dx, dy);
           if (d > 0 && d < PLAYER_R + BALL_R + KICK_DIST) {
             b.vx += (dx / d) * KICK_STRENGTH * BALL_INV_MASS;
             b.vy += (dy / d) * KICK_STRENGTH * BALL_INV_MASS;
-            me.kickReady = false;
+            p.kickReady = false;
+            p.kickPending = 0;
             b.k = (b.k || 0) + 1;
-            lastKickCount.current = Math.max(lastKickCount.current || 0, b.k);
-            lastLocalKick.current = performance.now();
-            touched = true;
+            touched(id);
             sounds.playKick();
             spawnParticles(b.x, b.y, "#ffffff", 6, 0.8);
           }
         }
-        me.inv = PLAYER_INV_VS_BALL; // el balón casi no me mueve
-        if (collide(me, b, REST_PLAYER_BALL)) touched = true;
-        me.inv = PLAYER_INV_MASS;
-      }
+        if (p.kickPending > 0) p.kickPending--;
 
-      // Los demás jugadores también tocan el balón en mi pantalla
-      for (const id in all) {
-        if (id !== uid) {
-          collide(asDisc(all[id], PLAYER_INV_VS_BALL), b, REST_PLAYER_BALL);
-        }
+        // El balón casi no mueve al jugador (control absoluto)
+        p.inv = PLAYER_INV_VS_BALL;
+        if (collide(p, b, REST_PLAYER_BALL)) touched(id);
+        p.inv = PLAYER_INV_MASS;
       }
-      for (let i = 0; i < POST_DISCS.length; i++) {
-        collide(b, POST_DISCS[i], REST_POST);
-      }
+      for (let i = 0; i < POST_DISCS.length; i++) collide(b, POST_DISCS[i], REST_POST);
       const scorer = ballWalls(b);
 
-      // Si el balón está aplastado contra la pared o un poste, ahora es el
-      // balón el que me frena a mí (si no, se metería dentro del jugador)
-      if (me) {
+      // Si el balón está aplastado contra la pared, frena al jugador
+      for (const id of ids) {
+        const p = all[id];
         stuckBall.x = b.x;
         stuckBall.y = b.y;
         stuckBall.vx = b.vx;
         stuckBall.vy = b.vy;
-        collide(me, stuckBall, 0);
+        collide(p, stuckBall, 0);
       }
 
-      if (touched) {
-        claimBall();
-        markTouch();
-        endKickoff();
+      if (scorer && !goalOpen.current && !goalPending.current && km.phase !== "over") {
+        reportGoal(scorer);
       }
 
-      if (own.current.o === uid) {
-        if (
-          scorer &&
-          !goalOpen.current &&
-          !goalPending.current &&
-          metaNow.current.phase !== "over"
-        ) {
-          reportGoal(scorer);
-        }
-      } else if (ballNet.current) {
-        // Corrección suave hacia el balón del dueño
-        const p = predictNet(ballNet.current);
-        const ex = p.x - b.x;
-        const ey = p.y - b.y;
-        if (ex * ex + ey * ey > 70 * 70) {
-          b.x = b.px = p.x;
-          b.y = b.py = p.y;
-          b.vx = p.vx;
-          b.vy = p.vy;
-        } else {
-          const f = 0.15;
-          b.x += ex * f;
-          b.y += ey * f;
-          b.vx += (p.vx - b.vx) * f;
-          b.vy += (p.vy - b.vy) * f;
-        }
-      }
-
-      // Estela (reutiliza objetos)
       const tr = b.trail;
       const head = tr.length >= 8 ? tr.pop() : { x: 0, y: 0 };
       head.x = b.x;
       head.y = b.y;
       tr.unshift(head);
+    };
+
+    // ---------- INVITADO: predice solo su jugador ----------
+    const guestTick = (bits, now, tickRate) => {
+      const me = ents.current[uid];
+      if (!me) return;
+      me.px = me.x;
+      me.py = me.y;
+      me.isKicking = !!(bits & BIT_KICK);
+      stepPlayer(me, bits);
+
+      // No atravesar a los demás (tal y como los veo)
+      for (const id in ents.current) {
+        if (id === uid) continue;
+        const o = ents.current[id];
+        tmpDisc.x = o.x;
+        tmpDisc.y = o.y;
+        tmpDisc.vx = o.vx || 0;
+        tmpDisc.vy = o.vy || 0;
+        collide(me, tmpDisc, REST_PLAYER_PLAYER);
+      }
+      for (let i = 0; i < POST_DISCS.length; i++) collide(me, POST_DISCS[i], REST_POST);
+      applyKickoffLimits(me, metaNow.current);
+      clampToCanvas(me);
+
+      // Corrección suave hacia donde me tiene el host (él manda)
+      const hm = hostMe.current;
+      if (hm) {
+        const age = Math.min(
+          Math.max(((Date.now() - hm.t) / 1000) * tickRate + 3, 0),
+          15
+        );
+        const tx = hm.x + hm.vx * age;
+        const ty = hm.y + hm.vy * age;
+        const ex = tx - me.x;
+        const ey = ty - me.y;
+        if (ex * ex + ey * ey > 60 * 60) {
+          me.x = me.px = tx;
+          me.y = me.py = ty;
+          me.vx = hm.vx;
+          me.vy = hm.vy;
+        } else {
+          me.x += ex * 0.08;
+          me.y += ey * 0.08;
+          me.vx += (hm.vx - me.vx) * 0.08;
+          me.vy += (hm.vy - me.vy) * 0.08;
+        }
+      }
+
+      // Sonido inmediato de mi chut si el balón está cerca (el host decide de verdad)
+      if (kickPresses.current > myLastKc) {
+        myLastKc = kickPresses.current;
+        const b = ball.current;
+        if (Math.hypot(b.x - me.x, b.y - me.y) < PLAYER_R + BALL_R + KICK_DIST + 4) {
+          lastLocalKick.current = performance.now();
+          sounds.playKick();
+        }
+      }
     };
 
     // Si algo falla en un fotograma, que no se congele el juego entero
@@ -1689,51 +1695,72 @@ export default function App() {
       const dt = Math.min((now - last) / 1000, 0.1);
       last = now;
       const tickRate = 60 * speedRef.current;
+      const host = isHost.current;
+      const bits = readBits(now);
+      const all = ents.current;
+      const b = ball.current;
+      const crowded = playerIds.current.length > 8;
+      const syncMs = crowded ? SYNC_MS_CROWDED : SYNC_MS;
 
       // Física a ritmo fijo
       acc += dt * tickRate;
       let steps = 0;
       while (acc >= 1 && steps < 8) {
-        tick(now);
+        if (host) hostTick(bits);
+        else guestTick(bits, now, tickRate);
         acc -= 1;
         steps++;
       }
       if (steps === 8) acc = 0;
       const alpha = Math.min(acc, 1); // para dibujar entre dos ticks sin tirones
 
-      // Otros jugadores: predicción corta + suavizado
-      // Los demás se dibujan un poquito en el pasado (unos 0,1 s), entre dos
-      // datos ya recibidos: así no dan saltos aunque los datos lleguen irregulares.
-      const all = players.current;
-      const crowded = playerIds.current.length > 8;
-      const interpMs = (crowded ? SYNC_MS_CROWDED : SYNC_MS) * 1.5 + 25;
-      const renderT = Date.now() - interpMs;
       const wallNow = Date.now();
-      for (const id in all) {
-        if (id !== uid) {
+      if (host) {
+        // Todo viene de mi propia física: dibujo entre el tick anterior y el actual
+        for (const id in all) {
           const p = all[id];
-          interpPlayer(p, renderT, tickRate);
-          estimatePresent(p, tickRate);
-          // Sin datos en 2 s (envía un aviso cada 0,25 s): se le ha caído la conexión
-          const lastS = p.snaps && p.snaps[p.snaps.length - 1];
-          p.stale = !lastS || wallNow - lastS.t > 2000;
+          p.dx = lerp(p.px ?? p.x, p.x, alpha);
+          p.dy = lerp(p.py ?? p.y, p.y, alpha);
+          const inp = inputs.current[id];
+          p.stale = id !== uid && (!inp || wallNow - inp.at > 2500);
         }
+      } else {
+        // Los demás y el balón se dibujan un poquito en el pasado (~0,1 s),
+        // entre dos fotos del host: así se ven fluidos y todos ven lo mismo
+        const renderT = wallNow - (syncMs * 1.5 + 30);
+        for (const id in all) {
+          const p = all[id];
+          if (id === uid) {
+            p.dx = lerp(p.px ?? p.x, p.x, alpha);
+            p.dy = lerp(p.py ?? p.y, p.y, alpha);
+            p.stale = false;
+          } else {
+            interpPlayer(p, renderT, tickRate);
+            p.dx = p.x;
+            p.dy = p.y;
+            // "sin conexión": lo dice el host en la foto, o el host no responde
+            p.stale = !!p.staleHost || wallNow - lastStateRecv.current > 2000;
+          }
+        }
+        interpPlayer(b, renderT, tickRate);
+        b.px = b.x;
+        b.py = b.y;
+        const tr = b.trail;
+        const head = tr.length >= 8 ? tr.pop() : { x: 0, y: 0 };
+        head.x = b.x;
+        head.y = b.y;
+        tr.unshift(head);
       }
-
-      const b = ball.current;
-      const me = all[uid];
 
       // Seguridad: si algún número se ha estropeado (NaN), recolocar
       if (!Number.isFinite(b.x) || !Number.isFinite(b.y) || !Number.isFinite(b.vx)) {
-        b.x = b.px = CX;
-        b.y = b.py = CY;
-        b.vx = b.vy = 0;
+        resetBall();
       }
-      if (me && (!Number.isFinite(me.x) || !Number.isFinite(me.y))) {
-        const pos = spawnPos(me.team, 0);
-        me.x = me.px = pos.x;
-        me.y = me.py = pos.y;
-        me.vx = me.vy = 0;
+      for (const id in all) {
+        const p = all[id];
+        if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.vx)) {
+          placeAtSpawn(id);
+        }
       }
 
       // Efectos
@@ -1752,15 +1779,13 @@ export default function App() {
       fx.current.shake = Math.max(0, fx.current.shake - dt * 12);
       fx.current.flash = Math.max(0, fx.current.flash - dt * 1.5);
 
-      // Posiciones interpoladas para dibujar suave en cualquier monitor
-      if (me) {
-        meDraw.x = lerp(me.px ?? me.x, me.x, alpha);
-        meDraw.y = lerp(me.py ?? me.y, me.y, alpha);
-      }
+      // Dibujar (el balón del host, entre ticks)
       const bx = b.x;
       const by = b.y;
-      b.x = lerp(b.px ?? bx, bx, alpha);
-      b.y = lerp(b.py ?? by, by, alpha);
+      if (host) {
+        b.x = lerp(b.px ?? bx, bx, alpha);
+        b.y = lerp(b.py ?? by, by, alpha);
+      }
       const km = metaNow.current;
       renderGame(
         ctx,
@@ -1770,46 +1795,39 @@ export default function App() {
         particles.current,
         fx.current,
         uid,
-        meDraw,
-        km.kickoffActive ? km.kickoffTeam || "red" : null,
-        own.current.o
+        km.kickoffActive ? km.kickoffTeam || "red" : null
       );
       b.x = bx;
       b.y = by;
 
-      checkStaleOwner();
-
-      // Envío a la red (menos veces por segundo si hay mucha gente)
-      const syncMs =
-        playerIds.current.length > 8 ? SYNC_MS_CROWDED : SYNC_MS;
-      // (margen de 4 ms para que el ritmo de envío sea regular a 60/144 Hz)
-      if (now - lastSync >= syncMs - 4) {
-        lastSync = now;
-        const payload = {};
-        // Aunque no cambie nada, un aviso cada 250 ms para que los demás
-        // sepan que sigues ahí y te dibujen en tu sitio exacto
-        const heartbeat = now - lastHeartbeat > 250;
-
-        if (me) {
-          const s = posBody(me);
-          if (s !== lastPosStr || forceSync.current || heartbeat) {
-            lastPosStr = s;
-            payload[`pos/${uid}`] = encPos(me);
-          }
+      // Red
+      if (host) {
+        // El host manda la foto del partido
+        if (now - lastSync >= syncMs - 4) {
+          lastSync = now;
+          set(
+            ref(db, `${base}/state`),
+            encState(Date.now(), b.k || 0, b, all, info.current)
+          ).catch(() => {});
+        }
+      } else {
+        // Los demás mandan sus teclas (al cambiar, y un aviso cada 0,3 s)
+        const str = encInput(bits, kickPresses.current);
+        if (str !== lastInputStr || now - lastInputSent > 300) {
+          lastInputStr = str;
+          lastInputSent = now;
+          set(ref(db, `${base}/in/${uid}`), str).catch(() => {});
         }
 
-        if (own.current.o === uid) {
-          const s = ballBody(b, own.current.c, uid);
-          if (s !== lastBallStr || forceSync.current || heartbeat) {
-            lastBallStr = s;
-            payload.ball = encBall(b, own.current.c, uid);
+        // Si el host deja de mandar fotos (se le ha caído), otro pasa a ser host
+        if (wallNow - lastStateRecv.current > 1500 && wallNow - lastHostClaim > 3000) {
+          const candidates = playerIds.current
+            .filter((id) => id !== hostIdRef.current)
+            .sort();
+          if (candidates[0] === uid) {
+            lastHostClaim = wallNow;
+            update(ref(db, `${base}/meta`), { hostId: uid }).catch(() => {});
           }
-        }
-        if (heartbeat) lastHeartbeat = now;
-
-        forceSync.current = false;
-        if (Object.keys(payload).length) {
-          update(baseRef, payload).catch(() => {});
         }
       }
     };
@@ -1856,6 +1874,14 @@ export default function App() {
     }
   };
 
+  const playerEntry = (name, team, pos) => ({
+    name,
+    team,
+    sid: sidOf(user.uid),
+    sx: r1(pos.x),
+    sy: r1(pos.y),
+  });
+
   const createRoom = async () => {
     if (!user) return;
     const name = playerName.trim();
@@ -1889,9 +1915,7 @@ export default function App() {
           name: roomName.trim() || `Sala de ${name}`,
           isPublic,
         },
-        ball: encBall({ x: CX, y: CY, vx: 0, vy: 0, k: 0 }, 0, user.uid),
-        players: { [user.uid]: { name, team: selectedTeam } },
-        pos: { [user.uid]: encPos(pos) },
+        players: { [user.uid]: playerEntry(name, selectedTeam, pos) },
       });
       setRoomId(code);
     } catch (e) {
@@ -1930,8 +1954,7 @@ export default function App() {
       const pos = spawnPos(selectedTeam, rank);
       localStorage.setItem("haxball_player_name", name);
       await update(ref(db, `rooms/${code}`), {
-        [`players/${user.uid}`]: { name, team: selectedTeam },
-        [`pos/${user.uid}`]: encPos(pos),
+        [`players/${user.uid}`]: playerEntry(name, selectedTeam, pos),
       });
       setRoomId(code);
     } catch (e) {
@@ -1944,6 +1967,10 @@ export default function App() {
     if (playerIds.current.length <= 1) {
       remove(ref(db, `rooms/${roomId}`)).catch(() => {});
       remove(ref(db, `lobby/${roomId}`)).catch(() => {});
+    } else if (isHost.current) {
+      // Antes de irme, paso el mando a otro para que el partido no se pare
+      const others = playerIds.current.filter((id) => id !== user.uid).sort();
+      update(ref(db, `rooms/${roomId}/meta`), { hostId: others[0] }).catch(() => {});
     }
     setRoomId("");
     setMeta(null);
@@ -1954,11 +1981,11 @@ export default function App() {
 
   const switchTeam = (newTeam) => {
     setSelectedTeam(newTeam);
-    const rank = Object.keys(players.current).filter(
-      (id) => id !== user.uid && players.current[id].team === newTeam
+    const rank = Object.keys(info.current).filter(
+      (id) => id !== user.uid && info.current[id].team === newTeam
     ).length;
     const pos = spawnPos(newTeam, rank);
-    const me = players.current[user.uid];
+    const me = ents.current[user.uid];
     if (me) {
       me.team = newTeam;
       me.x = me.px = pos.x;
@@ -1966,9 +1993,10 @@ export default function App() {
       me.vx = 0;
       me.vy = 0;
     }
-    update(ref(db, `rooms/${roomId}`), {
-      [`players/${user.uid}/team`]: newTeam,
-      [`pos/${user.uid}`]: encPos(pos),
+    update(ref(db, `rooms/${roomId}/players/${user.uid}`), {
+      team: newTeam,
+      sx: r1(pos.x),
+      sy: r1(pos.y),
     }).catch(() => {});
   };
 
@@ -2042,7 +2070,7 @@ export default function App() {
     push(ref(db, `rooms/${roomId}/messages`), {
       sender: playerName,
       text,
-      team: players.current[user.uid]?.team || selectedTeam,
+      team: info.current[user.uid]?.team || selectedTeam,
       time: new Date().toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
@@ -2057,7 +2085,6 @@ export default function App() {
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
-
 
   // ----------------------------------------------------
   // Interfaz
