@@ -1437,6 +1437,7 @@ export default function App() {
     let lastInputStr = "";
     let lastInputSent = 0;
     let lastHostClaim = 0;
+    const ballFix = { x: 0, y: 0 }; // (invitado) ajuste visual del balón contra mi jugador
     let myLastKc = kickPresses.current;
 
     // Teclas que estoy pulsando ahora mismo
@@ -1743,6 +1744,36 @@ export default function App() {
           }
         }
         interpPlayer(b, renderT, tickRate);
+
+        // Tu jugador se dibuja "ahora", pero el balón llega del host con un pequeño
+        // retraso. Si en tu pantalla tu jugador ya lo está tocando, el balón se dibuja
+        // empujado hasta el borde para que nunca parezca que lo atraviesas. Cuando
+        // llega el balón real del host, el ajuste desaparece poco a poco.
+        const meP = all[uid];
+        let tx = 0;
+        let ty = 0;
+        if (meP && !meP.stale) {
+          const dx = b.x - meP.dx;
+          const dy = b.y - meP.dy;
+          const d = Math.hypot(dx, dy);
+          const minD = PLAYER_R + BALL_R;
+          if (d < minD) {
+            const nx = d > 0.001 ? dx / d : meP.vx >= 0 ? 1 : -1;
+            const ny = d > 0.001 ? dy / d : 0;
+            tx = nx * (minD - d);
+            ty = ny * (minD - d);
+          }
+        }
+        if (tx * tx + ty * ty >= ballFix.x * ballFix.x + ballFix.y * ballFix.y) {
+          ballFix.x = tx;
+          ballFix.y = ty;
+        } else {
+          const k = Math.min(1, dt * 12);
+          ballFix.x += (tx - ballFix.x) * k;
+          ballFix.y += (ty - ballFix.y) * k;
+        }
+        b.x += ballFix.x;
+        b.y += ballFix.y;
         b.px = b.x;
         b.py = b.y;
         const tr = b.trail;
