@@ -75,7 +75,7 @@ const GOAL_BOTTOM = CY + GOAL_HALF;
 const GOAL_DEPTH = 28;
 const POST_R = 8;
 const PLAYER_R = 16; // un pelín más grandes que en Haxball (15)
-const BALL_R = 9.5; // un pelín más pequeño que en Haxball (10) para controlar mejor
+const BALL_R = 7.5; // bastante más pequeño que en Haxball (10): más control y más juego
 
 // ----------------------------------------------------
 // Física (valores de Haxball, por "tick" a 60 ticks/s)
