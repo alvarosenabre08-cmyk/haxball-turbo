@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 11;
+const GAME_VERSION = 12;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
