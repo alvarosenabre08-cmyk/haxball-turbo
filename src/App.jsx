@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 15;
+const GAME_VERSION = 16;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -1459,10 +1459,6 @@ export default function App() {
     const rOld = { x: 0, y: 0, vx: 0, vy: 0 };
     const ballOff = { x: 0, y: 0 }; // pequeña corrección visual que se va apagando
     let prevHb = null;
-    // (invitado, sin predicción) Mi chut se ve al momento: el balón sale volando en mi
-    // pantalla y se va uniendo al balón real del host cuando el host lo confirma
-    let kickFx = null;
-    const projBall = { x: 0, y: 0, vx: 0, vy: 0 };
     let myLastKc = kickPresses.current;
 
     // Teclas que estoy pulsando ahora mismo
@@ -1658,27 +1654,9 @@ export default function App() {
         myLastKc = kickPresses.current;
         myKicks.push({ t: tickTime, k0: lastKickCount.current ?? 0 });
         const b = ball.current;
-        const dx = b.x - me.x;
-        const dy = b.y - me.y;
-        const d = Math.hypot(dx, dy);
-        if (d < PLAYER_R + BALL_R + KICK_DIST + 4) {
+        if (Math.hypot(b.x - me.x, b.y - me.y) < PLAYER_R + BALL_R + KICK_DIST + 4) {
           lastLocalKick.current = performance.now();
           sounds.playKick();
-          if (!predictRef.current && d > 0.001) {
-            kickFx = {
-              x: b.x,
-              y: b.y,
-              vx: (b.vx || 0) + (dx / d) * KICK_STRENGTH * BALL_INV_MASS,
-              vy: (b.vy || 0) + (dy / d) * KICK_STRENGTH * BALL_INV_MASS,
-              t0: Date.now(),
-              k0: lastKickCount.current ?? 0,
-              confirmed: false,
-              mix: 1,
-              back: false,
-              r: BALL_R,
-              inv: BALL_INV_MASS,
-            };
-          }
         }
       }
     };
@@ -1947,69 +1925,6 @@ export default function App() {
           ballOff.x = 0;
           ballOff.y = 0;
           interpPlayer(b, renderT, tickRate);
-
-          // Mi chut: el balón vuela al momento en mi pantalla
-          if (kickFx) {
-            const kf = kickFx;
-            const stepsF = dt * tickRate;
-            const damp = Math.pow(BALL_DAMPING, stepsF);
-            kf.x += kf.vx * stepsF;
-            kf.y += kf.vy * stepsF;
-            kf.vx *= damp;
-            kf.vy *= damp;
-            for (let j = 0; j < POST_DISCS.length; j++) collide(kf, POST_DISCS[j], REST_POST);
-            ballWalls(kf);
-            const lastB = hsn[hsn.length - 1];
-            const age = wallNow - kf.t0;
-            // ¿El host ya ha aplicado el chut? Entonces me voy pegando a su balón (llevado a "ahora")
-            if (!kf.confirmed && lastB && (lastB.k || 0) > kf.k0) kf.confirmed = true;
-            if (kf.confirmed && lastB) {
-              const st = Math.min(Math.max(((wallNow - lastB.t) / 1000) * tickRate, 0), 12);
-              const whole = Math.floor(st);
-              projBall.x = lastB.x;
-              projBall.y = lastB.y;
-              projBall.vx = lastB.vx;
-              projBall.vy = lastB.vy;
-              for (let i = 0; i < whole; i++) {
-                projBall.x += projBall.vx;
-                projBall.y += projBall.vy;
-                projBall.vx *= BALL_DAMPING;
-                projBall.vy *= BALL_DAMPING;
-                ballWalls(projBall);
-              }
-              projBall.x += projBall.vx * (st - whole);
-              projBall.y += projBall.vy * (st - whole);
-              const kk = Math.min(1, dt * 8);
-              kf.x += (projBall.x - kf.x) * kk;
-              kf.y += (projBall.y - kf.y) * kk;
-              kf.vx += (projBall.vx - kf.vx) * kk;
-              kf.vy += (projBall.vy - kf.vy) * kk;
-            }
-            // Vuelvo al balón normal cuando: el host no lo confirma, se frena,
-            // se acerca a otro jugador o ya ha pasado un rato
-            if (!kf.back) {
-              let nearOther = false;
-              for (const id in all) {
-                if (id === uid) continue;
-                const o = all[id];
-                if (Math.hypot((o.dx ?? o.x) - kf.x, (o.dy ?? o.y) - kf.y) < PLAYER_R + BALL_R + 25) nearOther = true;
-              }
-              const speed = Math.hypot(kf.vx, kf.vy);
-              if ((!kf.confirmed && age > 350) || (kf.confirmed && (speed < 1.2 || age > 1600)) || nearOther) {
-                kf.back = true;
-              }
-            }
-            if (kf.back) kf.mix -= dt / 0.3;
-            if (kf.mix <= 0) {
-              kickFx = null;
-            } else {
-              const m = Math.min(1, kf.mix);
-              b.x = lerp(b.x, kf.x, m);
-              b.y = lerp(b.y, kf.y, m);
-              b.vx = lerp(b.vx || 0, kf.vx, m);
-              b.vy = lerp(b.vy || 0, kf.vy, m);
-            }
-          }
         }
         b.px = b.x;
         b.py = b.y;
