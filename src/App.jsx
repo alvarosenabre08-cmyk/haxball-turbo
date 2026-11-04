@@ -853,6 +853,7 @@ export default function App() {
   const inputs = useRef({}); // (host) teclas de cada jugador
   const ball = useRef({ x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] });
   const hostMe = useRef(null); // (invitado) dónde me tiene el host
+  const hostMeView = useRef({ x: 0, y: 0, vx: 0, vy: 0, snaps: [] }); // (invitado) el host me ve así, en el pasado
   const lastStateRecv = useRef(0); // (invitado) última foto recibida del host
   const particles = useRef([]);
   const fx = useRef({ shake: 0, flash: 0, flashColor: RED });
@@ -955,6 +956,7 @@ export default function App() {
     sidMap.current = {};
     inputs.current = {};
     hostMe.current = null;
+    hostMeView.current = { x: 0, y: 0, vx: 0, vy: 0, snaps: [] };
     ball.current = { x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] };
     lastKickoff.current = null;
     lastGoalAt.current = null;
@@ -1103,6 +1105,7 @@ export default function App() {
         } else {
           placeAtSpawn(uid);
           hostMe.current = null;
+          hostMeView.current.snaps = [];
           for (const id in ents.current) ents.current[id].snaps = [];
         }
         resetBall();
@@ -1225,6 +1228,11 @@ export default function App() {
         if (!p) continue;
         if (id === uid) {
           hostMe.current = { t: lt, x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy };
+          const hs = hostMeView.current.snaps;
+          if (!hs.length || lt > hs[hs.length - 1].t) {
+            hs.push({ t: lt, x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy });
+            if (hs.length > 20) hs.shift();
+          }
           continue;
         }
         const s = p.snaps;
@@ -1746,32 +1754,30 @@ export default function App() {
         interpPlayer(b, renderT, tickRate);
 
         // Tu jugador se dibuja "ahora", pero el balón llega del host con un pequeño
-        // retraso. Si en tu pantalla tu jugador ya lo está tocando, el balón se dibuja
-        // empujado hasta el borde para que nunca parezca que lo atraviesas. Cuando
-        // llega el balón real del host, el ajuste desaparece poco a poco.
+        // retraso. Cuando el host dice que de verdad estás tocando el balón (conduciéndolo),
+        // se dibuja pegado al borde de tu jugador para que no parezca que lo atraviesas.
+        // Si el host no te ve tocándolo, no se toca nada (así el balón no da vueltas raras).
         const meP = all[uid];
+        const hv = hostMeView.current;
+        interpPlayer(hv, renderT, tickRate);
         let tx = 0;
         let ty = 0;
-        if (meP && !meP.stale) {
+        const minD = PLAYER_R + BALL_R;
+        const hostTouch =
+          hv.snaps.length > 0 && Math.hypot(b.x - hv.x, b.y - hv.y) < minD + 4;
+        if (meP && !meP.stale && hostTouch) {
           const dx = b.x - meP.dx;
           const dy = b.y - meP.dy;
           const d = Math.hypot(dx, dy);
-          const minD = PLAYER_R + BALL_R;
-          if (d < minD) {
-            const nx = d > 0.001 ? dx / d : meP.vx >= 0 ? 1 : -1;
-            const ny = d > 0.001 ? dy / d : 0;
-            tx = nx * (minD - d);
-            ty = ny * (minD - d);
+          if (d < minD && d > 0.001) {
+            const push = Math.min(minD - d, 14);
+            tx = (dx / d) * push;
+            ty = (dy / d) * push;
           }
         }
-        if (tx * tx + ty * ty >= ballFix.x * ballFix.x + ballFix.y * ballFix.y) {
-          ballFix.x = tx;
-          ballFix.y = ty;
-        } else {
-          const k = Math.min(1, dt * 12);
-          ballFix.x += (tx - ballFix.x) * k;
-          ballFix.y += (ty - ballFix.y) * k;
-        }
+        const k = Math.min(1, dt * 10);
+        ballFix.x += (tx - ballFix.x) * k;
+        ballFix.y += (ty - ballFix.y) * k;
         b.x += ballFix.x;
         b.y += ballFix.y;
         b.px = b.x;
