@@ -853,7 +853,6 @@ export default function App() {
   const inputs = useRef({}); // (host) teclas de cada jugador
   const ball = useRef({ x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] });
   const hostMe = useRef(null); // (invitado) dónde me tiene el host
-  const hostMeView = useRef({ x: 0, y: 0, vx: 0, vy: 0, snaps: [] }); // (invitado) el host me ve así, en el pasado
   const lastStateRecv = useRef(0); // (invitado) última foto recibida del host
   const particles = useRef([]);
   const fx = useRef({ shake: 0, flash: 0, flashColor: RED });
@@ -956,7 +955,6 @@ export default function App() {
     sidMap.current = {};
     inputs.current = {};
     hostMe.current = null;
-    hostMeView.current = { x: 0, y: 0, vx: 0, vy: 0, snaps: [] };
     ball.current = { x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] };
     lastKickoff.current = null;
     lastGoalAt.current = null;
@@ -1105,7 +1103,6 @@ export default function App() {
         } else {
           placeAtSpawn(uid);
           hostMe.current = null;
-          hostMeView.current.snaps = [];
           for (const id in ents.current) ents.current[id].snaps = [];
         }
         resetBall();
@@ -1228,11 +1225,6 @@ export default function App() {
         if (!p) continue;
         if (id === uid) {
           hostMe.current = { t: lt, x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy };
-          const hs = hostMeView.current.snaps;
-          if (!hs.length || lt > hs[hs.length - 1].t) {
-            hs.push({ t: lt, x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy });
-            if (hs.length > 20) hs.shift();
-          }
           continue;
         }
         const s = p.snaps;
@@ -1445,7 +1437,11 @@ export default function App() {
     let lastInputStr = "";
     let lastInputSent = 0;
     let lastHostClaim = 0;
-    const ballFix = { x: 0, y: 0 }; // (invitado) ajuste visual del balón contra mi jugador
+    // (invitado) balón predicho en mi pantalla: reacciona al momento cuando lo toco
+    // y se va corrigiendo hacia el balón real del host
+    const pb = { x: CX, y: CY, vx: 0, vy: 0, px: CX, py: CY, r: BALL_R, inv: BALL_INV_MASS, init: false };
+    let lastLocalTouch = -1e9;
+    const hostNowBall = { x: 0, y: 0, vx: 0, vy: 0 };
     let myLastKc = kickPresses.current;
 
     // Teclas que estoy pulsando ahora mismo
@@ -1631,7 +1627,118 @@ export default function App() {
     // ---------- INVITADO: predice solo su jugador ----------
     const guestTick = (bits, now, tickRate) => {
       const me = ents.current[uid];
-      if (!me) return;
+      if (me) guestMoveMe(me, bits, tickRate);
+      guestBall(me, now, tickRate);
+    };
+
+    // Dónde está otro jugador "ahora" (su último dato + lo que se ha movido desde entonces)
+    const presentOf = (o, tickRate) => {
+      const s = o.snaps;
+      const ls = s && s[s.length - 1];
+      tmpDisc.inv = PLAYER_INV_VS_BALL;
+      if (!ls) {
+        tmpDisc.x = o.x;
+        tmpDisc.y = o.y;
+        tmpDisc.vx = o.vx || 0;
+        tmpDisc.vy = o.vy || 0;
+        return tmpDisc;
+      }
+      const age = (Math.min(Math.max(Date.now() - ls.t, 0), 160) / 1000) * tickRate;
+      tmpDisc.x = ls.x + ls.vx * age;
+      tmpDisc.y = ls.y + ls.vy * age;
+      tmpDisc.vx = ls.vx;
+      tmpDisc.vy = ls.vy;
+      return tmpDisc;
+    };
+
+    const guestBall = (me, now, tickRate) => {
+      const hs = ball.current.snaps;
+      const hb = hs[hs.length - 1];
+      if (!hb) return;
+      if (!pb.init) {
+        Object.assign(pb, { x: hb.x, y: hb.y, px: hb.x, py: hb.y, vx: hb.vx, vy: hb.vy, init: true });
+      }
+      pb.px = pb.x;
+      pb.py = pb.y;
+      pb.x += pb.vx;
+      pb.y += pb.vy;
+      pb.vx *= BALL_DAMPING;
+      pb.vy *= BALL_DAMPING;
+
+      let touched = false;
+      if (me && !me.stale) {
+        // Mi chut, al momento en mi pantalla (el host lo aplica igual al recibirlo)
+        if (kickPresses.current > myLastKc) {
+          myLastKc = kickPresses.current;
+          const dx = pb.x - me.x;
+          const dy = pb.y - me.y;
+          const d = Math.hypot(dx, dy);
+          if (d > 0 && d < PLAYER_R + BALL_R + KICK_DIST + 2) {
+            pb.vx += (dx / d) * KICK_STRENGTH * BALL_INV_MASS;
+            pb.vy += (dy / d) * KICK_STRENGTH * BALL_INV_MASS;
+            touched = true;
+            lastLocalKick.current = performance.now();
+            sounds.playKick();
+          }
+        }
+        me.inv = PLAYER_INV_VS_BALL;
+        if (collide(me, pb, REST_PLAYER_BALL)) touched = true;
+        me.inv = PLAYER_INV_MASS;
+      }
+      for (const id in ents.current) {
+        if (id === uid) continue;
+        collide(presentOf(ents.current[id], tickRate), pb, REST_PLAYER_BALL);
+      }
+      for (let i = 0; i < POST_DISCS.length; i++) collide(pb, POST_DISCS[i], REST_POST);
+      ballWalls(pb);
+      if (me && !me.stale) {
+        stuckBall.x = pb.x;
+        stuckBall.y = pb.y;
+        stuckBall.vx = pb.vx;
+        stuckBall.vy = pb.vy;
+        collide(me, stuckBall, 0);
+      }
+      if (touched) lastLocalTouch = now;
+
+      // Balón del host llevado hasta "ahora" (rebotando en las paredes)
+      const steps = Math.min(Math.max(((Date.now() - hb.t) / 1000) * tickRate, 0), 15);
+      const whole = Math.floor(steps);
+      hostNowBall.x = hb.x;
+      hostNowBall.y = hb.y;
+      hostNowBall.vx = hb.vx;
+      hostNowBall.vy = hb.vy;
+      for (let i = 0; i < whole; i++) {
+        hostNowBall.x += hostNowBall.vx;
+        hostNowBall.y += hostNowBall.vy;
+        hostNowBall.vx *= BALL_DAMPING;
+        hostNowBall.vy *= BALL_DAMPING;
+        ballWalls(hostNowBall);
+      }
+      hostNowBall.x += hostNowBall.vx * (steps - whole);
+      hostNowBall.y += hostNowBall.vy * (steps - whole);
+
+      // Corrección: si lo estoy tocando yo, manda mi pantalla (suave);
+      // si no, manda el host (rápido). Si se separan mucho, salto al del host.
+      const ex = hostNowBall.x - pb.x;
+      const ey = hostNowBall.y - pb.y;
+      const nearMe =
+        me && !me.stale && Math.hypot(pb.x - me.x, pb.y - me.y) < PLAYER_R + BALL_R + 25;
+      const recent = now - lastLocalTouch < 300;
+      if (ex * ex + ey * ey > 70 * 70 && !recent) {
+        pb.x = pb.px = hostNowBall.x;
+        pb.y = pb.py = hostNowBall.y;
+        pb.vx = hostNowBall.vx;
+        pb.vy = hostNowBall.vy;
+      } else {
+        const k = recent ? 0.02 : nearMe ? 0.06 : 0.2;
+        pb.x += ex * k;
+        pb.y += ey * k;
+        pb.vx += (hostNowBall.vx - pb.vx) * k;
+        pb.vy += (hostNowBall.vy - pb.vy) * k;
+      }
+    };
+
+    const guestMoveMe = (me, bits, tickRate) => {
       me.px = me.x;
       me.py = me.y;
       me.isKicking = !!(bits & BIT_KICK);
@@ -1675,15 +1782,6 @@ export default function App() {
         }
       }
 
-      // Sonido inmediato de mi chut si el balón está cerca (el host decide de verdad)
-      if (kickPresses.current > myLastKc) {
-        myLastKc = kickPresses.current;
-        const b = ball.current;
-        if (Math.hypot(b.x - me.x, b.y - me.y) < PLAYER_R + BALL_R + KICK_DIST + 4) {
-          lastLocalKick.current = performance.now();
-          sounds.playKick();
-        }
-      }
     };
 
     // Si algo falla en un fotograma, que no se congele el juego entero
@@ -1751,35 +1849,15 @@ export default function App() {
             p.stale = !!p.staleHost || wallNow - lastStateRecv.current > 2000;
           }
         }
-        interpPlayer(b, renderT, tickRate);
-
-        // Tu jugador se dibuja "ahora", pero el balón llega del host con un pequeño
-        // retraso. Cuando el host dice que de verdad estás tocando el balón (conduciéndolo),
-        // se dibuja pegado al borde de tu jugador para que no parezca que lo atraviesas.
-        // Si el host no te ve tocándolo, no se toca nada (así el balón no da vueltas raras).
-        const meP = all[uid];
-        const hv = hostMeView.current;
-        interpPlayer(hv, renderT, tickRate);
-        let tx = 0;
-        let ty = 0;
-        const minD = PLAYER_R + BALL_R;
-        const hostTouch =
-          hv.snaps.length > 0 && Math.hypot(b.x - hv.x, b.y - hv.y) < minD + 4;
-        if (meP && !meP.stale && hostTouch) {
-          const dx = b.x - meP.dx;
-          const dy = b.y - meP.dy;
-          const d = Math.hypot(dx, dy);
-          if (d < minD && d > 0.001) {
-            const push = Math.min(minD - d, 14);
-            tx = (dx / d) * push;
-            ty = (dy / d) * push;
-          }
+        // El balón se dibuja donde lo predice mi pantalla (entre dos pasos)
+        if (pb.init) {
+          b.x = lerp(pb.px, pb.x, alpha);
+          b.y = lerp(pb.py, pb.y, alpha);
+          b.vx = pb.vx;
+          b.vy = pb.vy;
+        } else {
+          interpPlayer(b, renderT, tickRate);
         }
-        const k = Math.min(1, dt * 10);
-        ballFix.x += (tx - ballFix.x) * k;
-        ballFix.y += (ty - ballFix.y) * k;
-        b.x += ballFix.x;
-        b.y += ballFix.y;
         b.px = b.x;
         b.py = b.y;
         const tr = b.trail;
