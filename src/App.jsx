@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 16;
+const GAME_VERSION = 17;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -212,7 +212,9 @@ const decState = (str) => {
 };
 
 // Teclas de un jugador: "teclas,vecesQueHaPulsadoChutar"
-const encInput = (bits, kc) => `${bits},${kc}`;
+// El tercer número cambia en cada envío: así el host sabe que sigues conectado
+// aunque estés quieto (si el texto no cambia, Firebase no avisa)
+const encInput = (bits, kc, seq) => `${bits},${kc},${seq}`;
 const decInput = (str) => {
   if (typeof str !== "string") return null;
   const a = str.split(",");
@@ -267,6 +269,107 @@ const interpPlayer = (p, renderT, tickRate) => {
 };
 
 // Posición de saque: cada jugador del equipo en una altura distinta
+// ----------------------------------------------------
+// Bots
+// ----------------------------------------------------
+const BOT_PREFIX = "~bot";
+const isBot = (id) => typeof id === "string" && id.startsWith(BOT_PREFIX);
+const BOT_NAMES = ["Rayo", "Muro", "Turbo", "Tanque", "Chispa", "Pulpo", "Cohete", "Halcón", "Trueno", "Ciclón"];
+const BOT_LEVELS = {
+  facil: { label: "Fácil", think: 9, look: 2, aim: 0.7, shotRange: 300, noise: 30 },
+  normal: { label: "Normal", think: 4, look: 5, aim: 0.84, shotRange: 420, noise: 10 },
+  dificil: { label: "Difícil", think: 1, look: 8, aim: 0.9, shotRange: 540, noise: 0 },
+};
+
+// Decide qué teclas pulsa un bot (lo calcula el host en cada paso)
+function botThink(id, p, ball, all, inf, km, level, st, tick) {
+  const L = BOT_LEVELS[level] || BOT_LEVELS.normal;
+  const dir = p.team === "red" ? 1 : -1; // hacia dónde ataca
+  const goalX = dir > 0 ? PITCH.right + 10 : PITCH.left - 10;
+  const ownX = dir > 0 ? PITCH.left : PITCH.right;
+  const reach = PLAYER_R + BALL_R + KICK_DIST;
+
+  // Saque de centro: si no saca mi equipo, me quedo quieto en mi sitio
+  if (km.kickoffActive && p.team !== (km.kickoffTeam || "red")) {
+    st.kick = 0;
+    return 0;
+  }
+
+  if (tick - (st.lastThink ?? -99) >= L.think) {
+    st.lastThink = tick;
+    const bx = ball.x + ball.vx * L.look;
+    const by = ball.y + ball.vy * L.look;
+    const myD = Math.hypot(p.x - bx, p.y - by);
+
+    // ¿Algún compañero está bastante más cerca del balón? Entonces defiendo
+    let closer = false;
+    let rankInTeam = 0;
+    for (const oid in all) {
+      if (oid === id || inf[oid]?.team !== p.team) continue;
+      const o = all[oid];
+      if (Math.hypot(o.x - bx, o.y - by) + 25 < myD) closer = true;
+      if (isBot(oid) && oid < id) rankInTeam++;
+    }
+    if (km.kickoffActive) closer = false;
+
+    if (!closer) {
+      // Me pongo detrás del balón mirando a la portería rival y empujo
+      let ux = goalX - bx;
+      let uy = CY - by;
+      const ul = Math.hypot(ux, uy) || 1;
+      ux /= ul;
+      uy /= ul;
+      const rel = (p.x - bx) * ux + (p.y - by) * uy; // > 0: estoy por delante del balón
+      if (rel > -6) {
+        // Lado malo: doy la vuelta al balón por el lado más corto
+        const px = -uy;
+        const py = ux;
+        const sgn = (p.x - bx) * px + (p.y - by) * py >= 0 ? 1 : -1;
+        st.tx = bx - ux * 34 + px * sgn * 30;
+        st.ty = by - uy * 34 + py * sgn * 30;
+      } else {
+        st.tx = bx + ux * 14;
+        st.ty = by + uy * 14;
+      }
+      // ¿Chuto?
+      const dx = ball.x - p.x;
+      const dy = ball.y - p.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const aim = (dx / d) * ux + (dy / d) * uy;
+      const distGoal = Math.abs(goalX - ball.x);
+      const nearOwn = Math.abs(ball.x - ownX) < 220 && (dx / d) * dir > 0.2;
+      if (d < reach - 1 && tick - (st.lastKick ?? -99) > 25) {
+        if ((aim > L.aim && distGoal < L.shotRange) || nearOwn) {
+          st.kick = 2;
+          st.lastKick = tick;
+        }
+      }
+    } else {
+      // Defensa: entre el balón y mi portería
+      const f = 0.3 + rankInTeam * 0.12;
+      st.tx = ownX + (bx - ownX) * f;
+      st.ty = CY + (by - CY) * 0.55 + (rankInTeam % 2 ? 40 : -40) * (rankInTeam > 0 ? 1 : 0);
+    }
+    if (L.noise) {
+      st.tx += (Math.random() - 0.5) * L.noise;
+      st.ty += (Math.random() - 0.5) * L.noise;
+    }
+  }
+
+  let bits = 0;
+  const ex = (st.tx ?? p.x) - p.x;
+  const ey = (st.ty ?? p.y) - p.y;
+  if (ex > 4) bits |= BIT_RIGHT;
+  if (ex < -4) bits |= BIT_LEFT;
+  if (ey > 4) bits |= BIT_DOWN;
+  if (ey < -4) bits |= BIT_UP;
+  if (st.kick > 0) {
+    bits |= BIT_KICK;
+    st.kick--;
+  }
+  return bits;
+}
+
 const spawnPos = (team, rank = 0) => {
   const offsets = [0, -70, 70, -140, 140, -35, 35, -105, 105];
   return {
@@ -1002,7 +1105,7 @@ export default function App() {
 
     const ensureHost = () => {
       if (hostIdRef.current === null) return;
-      const ids = playerIds.current;
+      const ids = playerIds.current.filter((id) => !isBot(id));
       if (!ids.length || ids.includes(hostIdRef.current)) return;
       if ([...ids].sort()[0] === uid) {
         update(ref(db, `${base}/meta`), { hostId: uid });
@@ -1129,7 +1232,7 @@ export default function App() {
       for (const id in data) {
         const d = data[id];
         const prevTeam = info.current[id]?.team;
-        info.current[id] = { name: d.name, team: d.team, sid: d.sid || sidOf(id) };
+        info.current[id] = { name: d.name, team: d.team, sid: d.sid || sidOf(id), bot: !!d.bot };
         sidMap.current[d.sid || sidOf(id)] = id;
         let p = map[id];
         const sx = Number.isFinite(d.sx) ? d.sx : spawnPos(d.team, 0).x;
@@ -1180,6 +1283,7 @@ export default function App() {
         uid: id,
         name: data[id].name,
         team: data[id].team,
+        bot: !!data[id].bot,
       }));
       const sig = list.map((p) => `${p.uid}:${p.name}:${p.team}`).join("|");
       if (sig !== listSig.current) {
@@ -1335,7 +1439,7 @@ export default function App() {
     // Si el host minimiza la pestaña, el partido se pararía: pasa el mando a otro
     const onVisibility = () => {
       if (!document.hidden || !isHost.current) return;
-      const others = playerIds.current.filter((id) => id !== uid).sort();
+      const others = playerIds.current.filter((id) => id !== uid && !isBot(id)).sort();
       if (!others.length) return;
       update(ref(db, `${base}/meta`), { hostId: others[0] }).catch(() => {});
     };
@@ -1446,6 +1550,7 @@ export default function App() {
     let lastSync = 0;
     let lastInputStr = "";
     let lastInputSent = 0;
+    let inputSeq = 0;
     let lastHostClaim = 0;
     // (invitado) balón predicho en mi pantalla: reacciona al momento cuando lo toco
     // y se va corrigiendo hacia el balón real del host
@@ -1535,7 +1640,10 @@ export default function App() {
     };
 
     // ---------- HOST: calcula todo el partido ----------
+    const botState = {}; // memoria de cada bot
+    let botTick = 0;
     const hostTick = (bits) => {
+      botTick++;
       const all = ents.current;
       const inf = info.current;
       const b = ball.current;
@@ -1561,7 +1669,10 @@ export default function App() {
         p.py = p.y;
         let pb = 0;
         if (id === uid) pb = bits;
-        else {
+        else if (inf[id]?.bot) {
+          const st = botState[id] || (botState[id] = {});
+          pb = botThink(id, p, b, all, inf, km, km.botLevel || "normal", st, botTick);
+        } else {
           const inp = inputs.current[id];
           // Si no llegan sus teclas en 1,5 s (se ha caído), se queda quieto
           if (inp && nowMs - inp.at < 1500) pb = inp.bits;
@@ -1866,7 +1977,7 @@ export default function App() {
           p.dx = lerp(p.px ?? p.x, p.x, alpha);
           p.dy = lerp(p.py ?? p.y, p.y, alpha);
           const inp = inputs.current[id];
-          p.stale = id !== uid && (!inp || wallNow - inp.at > 2500);
+          p.stale = id !== uid && !info.current[id]?.bot && (!inp || wallNow - inp.at > 2500);
         }
       } else {
         // Los demás y el balón se dibujan un poquito en el pasado (~0,1 s),
@@ -1995,17 +2106,18 @@ export default function App() {
         }
       } else {
         // Los demás mandan sus teclas (al cambiar, y un aviso cada 0,3 s)
-        const str = encInput(bits, kickPresses.current);
+        const str = encInput(bits, kickPresses.current, 0);
         if (str !== lastInputStr || now - lastInputSent > 300) {
           lastInputStr = str;
           lastInputSent = now;
-          set(ref(db, `${base}/in/${uid}`), str).catch(() => {});
+          inputSeq = (inputSeq + 1) % 1000;
+          set(ref(db, `${base}/in/${uid}`), encInput(bits, kickPresses.current, inputSeq)).catch(() => {});
         }
 
         // Si el host deja de mandar fotos (se le ha caído), otro pasa a ser host
         if (wallNow - lastStateRecv.current > 1500 && wallNow - lastHostClaim > 3000) {
           const candidates = playerIds.current
-            .filter((id) => id !== hostIdRef.current)
+            .filter((id) => id !== hostIdRef.current && !isBot(id))
             .sort();
           if (candidates[0] === uid) {
             lastHostClaim = wallNow;
@@ -2147,12 +2259,12 @@ export default function App() {
   };
 
   const leaveRoom = () => {
-    if (playerIds.current.length <= 1) {
+    if (playerIds.current.filter((id) => !isBot(id)).length <= 1) {
       remove(ref(db, `rooms/${roomId}`)).catch(() => {});
       remove(ref(db, `lobby/${roomId}`)).catch(() => {});
     } else if (isHost.current) {
       // Antes de irme, paso el mando a otro para que el partido no se pare
-      const others = playerIds.current.filter((id) => id !== user.uid).sort();
+      const others = playerIds.current.filter((id) => id !== user.uid && !isBot(id)).sort();
       update(ref(db, `rooms/${roomId}/meta`), { hostId: others[0] }).catch(() => {});
     }
     setRoomId("");
@@ -2206,6 +2318,28 @@ export default function App() {
       },
       { stats: null }
     );
+  };
+
+  // Bots (solo el host): son jugadores más de la sala que mueve el host
+  const addBot = (team) => {
+    if (!amHost) return;
+    if (playerIds.current.length >= MAX_PLAYERS) {
+      alert(`La sala está llena (máximo ${MAX_PLAYERS}).`);
+      return;
+    }
+    const id = BOT_PREFIX + Math.random().toString(36).slice(2, 7);
+    const used = new Set(playersList.map((p) => p.name));
+    const free = BOT_NAMES.filter((n) => !used.has(`🤖 ${n}`));
+    const name = `🤖 ${free.length ? free[(Math.random() * free.length) | 0] : "Bot"}`;
+    const rank = playersList.filter((p) => p.team === team).length;
+    const pos = spawnPos(team, rank);
+    update(ref(db, `rooms/${roomId}/players`), {
+      [id]: { name, team, sid: id.slice(0, 6), sx: r1(pos.x), sy: r1(pos.y), bot: true },
+    }).catch(() => {});
+  };
+  const removeBot = (id) => {
+    if (!amHost || !isBot(id)) return;
+    update(ref(db, `rooms/${roomId}`), { [`players/${id}`]: null, [`in/${id}`]: null }).catch(() => {});
   };
 
   const setMatchOption = (key, val) => {
@@ -2775,6 +2909,34 @@ export default function App() {
                       <option value="0">Privada</option>
                     </select>
                   </label>
+                  <label className="flex items-center gap-1">
+                    Bots
+                    <select
+                      value={meta?.botLevel || "normal"}
+                      onChange={(e) => setMatchOption("botLevel", e.target.value)}
+                      className="bg-slate-800 text-slate-200 rounded-md px-1.5 py-0.5"
+                    >
+                      {Object.entries(BOT_LEVELS).map(([k, v]) => (
+                        <option key={k} value={k}>
+                          {v.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    onClick={() => addBot("red")}
+                    className="px-2.5 py-1 rounded-lg font-bold text-white transition hover:brightness-110"
+                    style={{ background: RED }}
+                  >
+                    + Bot rojo
+                  </button>
+                  <button
+                    onClick={() => addBot("blue")}
+                    className="px-2.5 py-1 rounded-lg font-bold text-white transition hover:brightness-110"
+                    style={{ background: BLUE }}
+                  >
+                    + Bot azul
+                  </button>
                   <button
                     onClick={resetScore}
                     className="flex items-center gap-1 text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1 rounded-lg transition text-xs font-bold"
@@ -2825,6 +2987,15 @@ export default function App() {
                       )}
                     </div>
 
+                    {p.bot && amHost && (
+                      <button
+                        onClick={() => removeBot(p.uid)}
+                        className="text-[10px] font-bold bg-slate-800 hover:bg-red-600 text-slate-300 hover:text-white px-2.5 py-1 rounded-lg transition"
+                        title="Quitar bot"
+                      >
+                        Quitar
+                      </button>
+                    )}
                     {p.uid === user?.uid && (
                       <button
                         onClick={() =>
