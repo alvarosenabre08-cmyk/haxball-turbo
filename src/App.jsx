@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 13;
+const GAME_VERSION = 14;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -1806,6 +1806,19 @@ export default function App() {
         }
       }
 
+
+      // Sin predicción del balón: mi jugador no puede meterse dentro del balón
+      // tal y como lo veo (así nunca lo atravieso, por ejemplo contra la pared)
+      if (!predictRef.current) {
+        const b = ball.current;
+        if (Number.isFinite(b.x)) {
+          stuckBall.x = b.x;
+          stuckBall.y = b.y;
+          stuckBall.vx = 0;
+          stuckBall.vy = 0;
+          collide(me, stuckBall, 0);
+        }
+      }
     };
 
     // Si algo falla en un fotograma, que no se congele el juego entero
