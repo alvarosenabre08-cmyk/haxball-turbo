@@ -935,9 +935,11 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   // Predicción del balón para quien no es host (experimental, apagada por defecto)
-  const [predictBall, setPredictBall] = useState(() => {
+const [predictBall, setPredictBall] = useState(() => {
     try {
-      return localStorage.getItem("hx_predict") === "1";
+      const stored = localStorage.getItem("hx_predict");
+      // Si no existe valor guardado, por defecto activamos la predicción (true)
+      return stored !== null ? stored === "1" : true;
     } catch {
       return true;
     }
