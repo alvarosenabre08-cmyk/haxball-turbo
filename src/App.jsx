@@ -939,7 +939,7 @@ export default function App() {
     try {
       return localStorage.getItem("hx_predict") === "1";
     } catch {
-      return false;
+      return true;
     }
   });
   const predictRef = useRef(predictBall);
@@ -1920,16 +1920,19 @@ export default function App() {
 
       // Sin predicción del balón: mi jugador no puede meterse dentro del balón
       // tal y como lo veo (así nunca lo atravieso, por ejemplo contra la pared)
-      if (!predictRef.current) {
-        const b = ball.current;
-        if (Number.isFinite(b.x)) {
-          stuckBall.x = b.x;
-          stuckBall.y = b.y;
-          stuckBall.vx = 0;
-          stuckBall.vy = 0;
-          collide(me, stuckBall, 0);
-        }
-      }
+if (!predictRef.current) {
+  const b = ball.current;
+  if (Number.isFinite(b.x)) {
+    const dx = me.x - b.x;
+    const dy = me.y - b.y;
+    const dist = Math.hypot(dx, dy);
+    const minDist = PLAYER_R + BALL_R;
+    if (dist < minDist && dist > 0) {
+      me.x += (dx / dist) * (minDist - dist) * 0.15;
+      me.y += (dy / dist) * (minDist - dist) * 0.15;
+    }
+  }
+}
     };
 
     // Si algo falla en un fotograma, que no se congele el juego entero
