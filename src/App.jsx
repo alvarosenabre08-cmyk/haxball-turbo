@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 18;
+const GAME_VERSION = 19;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -218,7 +218,46 @@ const encInput = (bits, kc, seq) => `${bits},${kc},${seq}`;
 const decInput = (str) => {
   if (typeof str !== "string") return null;
   const a = str.split(",");
-  return { bits: +a[0] || 0, kc: +a[1] || 0 };
+  return { bits: +a[0] || 0, kc: +a[1] || 0, seq: +a[2] || 0 };
+};
+
+// ----------------------------------------------------
+// Conexión directa entre jugadores (WebRTC)
+// Firebase solo sirve para "presentarse"; después el host y cada invitado
+// se hablan directamente, PC con PC. Si no se puede (algunas redes lo
+// bloquean), el juego sigue funcionando a través de Firebase como antes.
+// ----------------------------------------------------
+const ICE_SERVERS = [
+  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+];
+const P2P_SUPPORTED =
+  typeof window !== "undefined" && typeof window.RTCPeerConnection === "function";
+
+// Espera a que el navegador termine de buscar rutas de conexión (o se rinde a los ms)
+const waitIce = (pc, ms) =>
+  new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    const t = setTimeout(resolve, ms);
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (pc.iceGatheringState === "complete") {
+        clearTimeout(t);
+        resolve();
+      }
+    });
+  });
+
+const closePeer = (o) => {
+  if (!o) return;
+  try {
+    o.dc?.close();
+  } catch {
+    /* nada */
+  }
+  try {
+    o.pc?.close();
+  } catch {
+    /* nada */
+  }
 };
 
 // Cada ordenador tiene su reloj: calculamos la diferencia con cada jugador
@@ -944,6 +983,7 @@ export default function App() {
   const [matchTime, setMatchTime] = useState(0); // segundos desde el inicio
   const [stats, setStats] = useState({}); // goles, asistencias y autogoles
   const [online, setOnline] = useState(true); // conexión con Firebase
+  const [netInfo, setNetInfo] = useState(null); // estado de la conexión directa
   const [versionWarn, setVersionWarn] = useState(false);
 
   const canvasRef = useRef(null);
@@ -961,6 +1001,8 @@ export default function App() {
   const ball = useRef({ x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] });
   const hostMe = useRef(null); // (invitado) dónde me tiene el host
   const lastStateRecv = useRef(0); // (invitado) última foto recibida del host
+  // Conexión directa: host -> { [invitado]: { pc, dc, sess } }; invitado -> { pc, dc, ... }
+  const p2p = useRef({ peers: {}, guest: null, lastState: 0 });
   const particles = useRef([]);
   const fx = useRef({ shake: 0, flash: 0, flashColor: RED });
   const isHost = useRef(false);
@@ -1131,6 +1173,7 @@ export default function App() {
       onDisconnect(baseRef).update({
         [`players/${uid}`]: null,
         [`in/${uid}`]: null,
+        [`rtc/${uid}`]: null,
       });
       const mine = info.current[uid];
       const me = ents.current[uid];
@@ -1289,12 +1332,14 @@ export default function App() {
 
     // Teclas de cada jugador (las usa el host)
     const inRef = ref(db, `${base}/in`);
-    const onInput = (snap) => {
-      const id = snap.key;
+    const handleInput = (id, str) => {
       if (id === uid) return;
-      const v = decInput(snap.val());
+      const v = decInput(str);
       if (!v) return;
-      inputs.current[id] = { bits: v.bits, at: Date.now() };
+      // Llegan por dos caminos (directo y Firebase): me quedo con el más nuevo
+      const prev = inputs.current[id];
+      if (prev && v.seq && prev.seq && v.seq < prev.seq) return;
+      inputs.current[id] = { bits: v.bits, at: Date.now(), seq: v.seq };
       const p = ents.current[id];
       if (p) {
         // Cada pulsación de chutar cuenta aunque haya sido muy rápida
@@ -1302,13 +1347,14 @@ export default function App() {
         p.lastKc = v.kc;
       }
     };
+    const onInput = (snap) => handleInput(snap.key, snap.val());
     const unsubInAdd = onChildAdded(inRef, onInput);
     const unsubInChg = onChildChanged(inRef, onInput);
 
     // Fotos del partido que manda el host (las usan los demás)
-    const unsubState = onValue(ref(db, `${base}/state`), (snap) => {
+    const handleState = (str) => {
       if (isHost.current) return;
-      const v = decState(snap.val());
+      const v = decState(str);
       if (!v) return;
       const lt = toLocalTime(`host:${hostIdRef.current}`, v.t);
       lastStateRecv.current = Date.now();
@@ -1343,7 +1389,144 @@ export default function App() {
         p.isKicking = sp.k;
         p.staleHost = sp.s;
       }
+    };
+    const unsubState = onValue(ref(db, `${base}/state`), (snap) => {
+      // Si llegan fotos por la conexión directa, las de Firebase sobran
+      if (Date.now() - p2p.current.lastState < 500) return;
+      handleState(snap.val());
     });
+
+    // ---------- Conexión directa (WebRTC) ----------
+    const P = p2p.current;
+    P.peers = {};
+    P.guest = null;
+    P.lastState = 0;
+    const rtcRef = ref(db, `${base}/rtc`);
+
+    // (host) Un invitado quiere conectarse directamente conmigo
+    const onRtc = async (snap) => {
+      const id = snap.key;
+      const v = snap.val();
+      if (!isHost.current || id === uid || !v || v.h !== uid || !v.o) return;
+      if (P.peers[id] && P.peers[id].sess === v.s) return;
+      closePeer(P.peers[id]);
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      const peer = { pc, dc: null, sess: v.s };
+      P.peers[id] = peer;
+      pc.ondatachannel = (e) => {
+        peer.dc = e.channel;
+        peer.dc.onmessage = (m) => handleInput(id, m.data);
+      };
+      pc.onconnectionstatechange = () => {
+        if (["failed", "closed"].includes(pc.connectionState) && P.peers[id] === peer) {
+          closePeer(peer);
+          delete P.peers[id];
+        }
+      };
+      try {
+        await pc.setRemoteDescription({ type: "offer", sdp: v.o });
+        await pc.setLocalDescription(await pc.createAnswer());
+        await waitIce(pc, 2000);
+        if (P.peers[id] !== peer) return;
+        update(ref(db, `${base}/rtc/${id}`), { a: pc.localDescription.sdp, as: v.s }).catch(() => {});
+      } catch (e) {
+        console.warn("Conexión directa (host):", e.message);
+        closePeer(peer);
+        if (P.peers[id] === peer) delete P.peers[id];
+      }
+    };
+    const unsubRtcAdd = P2P_SUPPORTED ? onChildAdded(rtcRef, onRtc) : () => {};
+    const unsubRtcChg = P2P_SUPPORTED ? onChildChanged(rtcRef, onRtc) : () => {};
+
+    // (invitado) Me conecto directamente con el host
+    let myRtcUnsub = null;
+    const guestConnect = async (hostId) => {
+      closePeer(P.guest);
+      if (myRtcUnsub) myRtcUnsub();
+      myRtcUnsub = null;
+      const tries = P.guest && P.guest.hostId === hostId ? P.guest.tries + 1 : 1;
+      const sess = Math.random().toString(36).slice(2, 10);
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      const dc = pc.createDataChannel("g", { ordered: false, maxRetransmits: 0 });
+      const g = { pc, dc, sess, hostId, tries, started: Date.now(), open: false, failed: false };
+      P.guest = g;
+      dc.onopen = () => {
+        g.open = true;
+      };
+      dc.onclose = () => {
+        g.open = false;
+        g.failed = true;
+      };
+      dc.onmessage = (m) => {
+        P.lastState = Date.now();
+        handleState(m.data);
+      };
+      pc.onconnectionstatechange = () => {
+        if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+          g.open = false;
+          g.failed = true;
+        }
+      };
+      try {
+        await pc.setLocalDescription(await pc.createOffer());
+        await waitIce(pc, 2000);
+        if (P.guest !== g) return;
+        await set(ref(db, `${base}/rtc/${uid}`), { h: hostId, s: sess, o: pc.localDescription.sdp });
+        myRtcUnsub = onValue(ref(db, `${base}/rtc/${uid}`), async (snap) => {
+          const v = snap.val();
+          if (!v || v.as !== sess || !v.a || P.guest !== g) return;
+          if (pc.signalingState !== "have-local-offer") return;
+          try {
+            await pc.setRemoteDescription({ type: "answer", sdp: v.a });
+          } catch (e) {
+            g.failed = true;
+          }
+        });
+      } catch (e) {
+        console.warn("Conexión directa (invitado):", e.message);
+        g.failed = true;
+      }
+    };
+
+    // Vigilante: abre, reintenta o cierra conexiones directas según quién sea el host
+    const rtcTimer = setInterval(() => {
+      const hostId = hostIdRef.current;
+      if (isHost.current) {
+        if (P.guest) {
+          closePeer(P.guest);
+          P.guest = null;
+        }
+        // Cierro las de jugadores que ya no están
+        for (const id in P.peers) {
+          if (!info.current[id]) {
+            closePeer(P.peers[id]);
+            delete P.peers[id];
+          }
+        }
+        const guests = playerIds.current.filter((id) => id !== uid && !isBot(id)).length;
+        const open = Object.values(P.peers).filter((p) => p.dc && p.dc.readyState === "open").length;
+        setNetInfo({ host: true, open, total: guests });
+        return;
+      }
+      // Invitado
+      for (const id in P.peers) closePeer(P.peers[id]);
+      P.peers = {};
+      if (!P2P_SUPPORTED || !hostId || hostId === uid || !info.current[uid]) {
+        setNetInfo({ host: false, mode: "relay" });
+        return;
+      }
+      const g = P.guest;
+      const stuck = g && !g.open && Date.now() - g.started > 8000;
+      if (!g || g.hostId !== hostId) {
+        guestConnect(hostId);
+      } else if ((g.failed || stuck) && g.tries < 4) {
+        const wait = 2000 * g.tries;
+        if (Date.now() - g.started > wait) guestConnect(hostId);
+      }
+      const cur = P.guest;
+      const mode = cur && cur.open ? "p2p" : cur && cur.tries >= 4 && (cur.failed || Date.now() - cur.started > 8000) ? "relay" : "connecting";
+      setNetInfo({ host: false, mode });
+    }, 1000);
 
     const unsubMsgs = onValue(
       query(ref(db, `${base}/messages`), limitToLast(30)),
@@ -1446,6 +1629,14 @@ export default function App() {
       unsubInAdd();
       unsubInChg();
       unsubState();
+      unsubRtcAdd();
+      unsubRtcChg();
+      if (myRtcUnsub) myRtcUnsub();
+      clearInterval(rtcTimer);
+      closePeer(P.guest);
+      P.guest = null;
+      for (const id in P.peers) closePeer(P.peers[id]);
+      P.peers = {};
       unsubMsgs();
       unsubStats();
       clearInterval(hostTimer);
@@ -1457,6 +1648,7 @@ export default function App() {
       update(baseRef, {
         [`players/${uid}`]: null,
         [`in/${uid}`]: null,
+        [`rtc/${uid}`]: null,
       }).catch(() => {});
     };
   }, [user, roomId]);
@@ -1545,6 +1737,7 @@ export default function App() {
     let lastInputStr = "";
     let lastInputSent = 0;
     let inputSeq = 0;
+    let lastFbInput = 0;
     let lastHostClaim = 0;
     // (invitado) balón predicho en mi pantalla: reacciona al momento cuando lo toco
     // y se va corrigiendo hacia el balón real del host
@@ -1976,7 +2169,9 @@ export default function App() {
       } else {
         // Los demás y el balón se dibujan un poquito en el pasado (~0,1 s),
         // entre dos fotos del host: así se ven fluidos y todos ven lo mismo
-        const renderT = wallNow - (syncMs * 1.5 + 30);
+        // Con conexión directa llegan muchas más fotos y más regulares: espero menos
+        const directNow = Date.now() - p2p.current.lastState < 500;
+        const renderT = wallNow - (directNow ? 50 : syncMs * 1.5 + 30);
         for (const id in all) {
           const p = all[id];
           if (id === uid) {
@@ -2089,23 +2284,54 @@ export default function App() {
       b.y = by;
 
       // Red
+      const P = p2p.current;
       if (host) {
-        // El host manda la foto del partido
-        if (now - lastSync >= syncMs - 4) {
+        // Por la conexión directa: una foto en cada paso de física (unas 60 por segundo)
+        const peers = Object.values(P.peers).filter((p) => p.dc && p.dc.readyState === "open");
+        let snapStr = null;
+        if (steps > 0 && peers.length) {
+          snapStr = encState(Date.now(), b.k || 0, b, all, info.current);
+          for (const p of peers) {
+            try {
+              p.dc.send(snapStr);
+            } catch {
+              /* se ha cerrado: el vigilante lo limpia */
+            }
+          }
+        }
+        // Por Firebase: para quien no tenga conexión directa (y como copia, más despacio)
+        const guests = playerIds.current.filter((id) => id !== uid && !isBot(id)).length;
+        const fbEvery = guests > 0 && peers.length >= guests ? 100 : syncMs;
+        if (now - lastSync >= fbEvery - 4) {
           lastSync = now;
           set(
             ref(db, `${base}/state`),
-            encState(Date.now(), b.k || 0, b, all, info.current)
+            snapStr || encState(Date.now(), b.k || 0, b, all, info.current)
           ).catch(() => {});
         }
       } else {
-        // Los demás mandan sus teclas (al cambiar, y un aviso cada 0,3 s)
+        // Los demás mandan sus teclas: por la conexión directa al momento,
+        // y por Firebase como copia (más a menudo si no hay conexión directa)
         const str = encInput(bits, kickPresses.current, 0);
-        if (str !== lastInputStr || now - lastInputSent > 300) {
+        const g = P.guest;
+        const direct = g && g.open && g.dc.readyState === "open";
+        const changed = str !== lastInputStr;
+        if (changed || now - lastInputSent > (direct ? 100 : 300)) {
           lastInputStr = str;
           lastInputSent = now;
-          inputSeq = (inputSeq + 1) % 1000;
-          set(ref(db, `${base}/in/${uid}`), encInput(bits, kickPresses.current, inputSeq)).catch(() => {});
+          inputSeq = Math.max(inputSeq + 1, Date.now());
+          const msg = encInput(bits, kickPresses.current, inputSeq);
+          if (direct) {
+            try {
+              g.dc.send(msg);
+            } catch {
+              /* nada */
+            }
+          }
+          if (!direct || now - lastFbInput > 1000) {
+            lastFbInput = now;
+            set(ref(db, `${base}/in/${uid}`), msg).catch(() => {});
+          }
         }
 
         // Si el host deja de mandar fotos (se le ha caído), otro pasa a ser host
@@ -2841,6 +3067,26 @@ export default function App() {
                   Chutar: <strong className="text-amber-400">ESPACIO</strong> o{" "}
                   <strong className="text-amber-400">X</strong>
                 </span>
+                {netInfo && (netInfo.host ? netInfo.total > 0 : true) && (
+                  <span
+                    className={`px-2 py-0.5 rounded-lg font-bold ${
+                      (netInfo.host ? netInfo.open === netInfo.total : netInfo.mode === "p2p")
+                        ? "bg-emerald-500/15 text-emerald-300"
+                        : netInfo.mode === "connecting" || (netInfo.host && netInfo.open < netInfo.total)
+                        ? "bg-slate-800 text-slate-300"
+                        : "bg-amber-500/15 text-amber-300"
+                    }`}
+                    title="Conexión directa entre tu PC y el del host (menos retraso)"
+                  >
+                    {netInfo.host
+                      ? `🔗 Directa con ${netInfo.open} de ${netInfo.total}`
+                      : netInfo.mode === "p2p"
+                      ? "🔗 Conexión directa"
+                      : netInfo.mode === "connecting"
+                      ? "⏳ Conectando directo…"
+                      : "☁ Vía servidor"}
+                  </span>
+                )}
               </div>
 
               {amHost && (
