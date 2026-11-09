@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 17;
+const GAME_VERSION = 18;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -934,16 +934,8 @@ export default function App() {
   const [chatMessage, setChatMessage] = useState("");
   const [copied, setCopied] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
-  // Predicción del balón para quien no es host (experimental, apagada por defecto)
-const [predictBall, setPredictBall] = useState(() => {
-    try {
-      const stored = localStorage.getItem("hx_predict");
-      // Si no existe valor guardado, por defecto activamos la predicción (true)
-      return stored !== null ? stored === "1" : true;
-    } catch {
-      return true;
-    }
-  });
+  // Predicción del balón (experimental): desactivada, metía demasiado retraso
+  const predictBall = false;
   const predictRef = useRef(predictBall);
   predictRef.current = predictBall;
   const [meta, setMeta] = useState(null);
@@ -1922,19 +1914,16 @@ const [predictBall, setPredictBall] = useState(() => {
 
       // Sin predicción del balón: mi jugador no puede meterse dentro del balón
       // tal y como lo veo (así nunca lo atravieso, por ejemplo contra la pared)
-if (!predictRef.current) {
-  const b = ball.current;
-  if (Number.isFinite(b.x)) {
-    const dx = me.x - b.x;
-    const dy = me.y - b.y;
-    const dist = Math.hypot(dx, dy);
-    const minDist = PLAYER_R + BALL_R;
-    if (dist < minDist && dist > 0) {
-      me.x += (dx / dist) * (minDist - dist) * 0.15;
-      me.y += (dy / dist) * (minDist - dist) * 0.15;
-    }
-  }
-}
+      if (!predictRef.current) {
+        const b = ball.current;
+        if (Number.isFinite(b.x)) {
+          stuckBall.x = b.x;
+          stuckBall.y = b.y;
+          stuckBall.vx = 0;
+          stuckBall.vy = 0;
+          collide(me, stuckBall, 0);
+        }
+      }
     };
 
     // Si algo falla en un fotograma, que no se congele el juego entero
@@ -2852,25 +2841,6 @@ if (!predictRef.current) {
                   Chutar: <strong className="text-amber-400">ESPACIO</strong> o{" "}
                   <strong className="text-amber-400">X</strong>
                 </span>
-                {!amHost && (
-                  <button
-                    onClick={() => {
-                      const v = !predictBall;
-                      setPredictBall(v);
-                      try {
-                        localStorage.setItem("hx_predict", v ? "1" : "0");
-                      } catch {
-                        /* nada */
-                      }
-                    }}
-                    className={`px-2 py-0.5 rounded-lg font-bold transition ${
-                      predictBall ? "bg-emerald-500 text-slate-950" : "bg-slate-800 text-slate-300 hover:bg-slate-700"
-                    }`}
-                    title="Calcula el balón en tu pantalla con tus movimientos (experimental)"
-                  >
-                    Predicción del balón: {predictBall ? "SÍ" : "NO"}
-                  </button>
-                )}
               </div>
 
               {amHost && (
