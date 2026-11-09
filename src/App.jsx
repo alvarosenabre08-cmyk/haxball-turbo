@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 19;
+const GAME_VERSION = 20;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -1000,6 +1000,7 @@ export default function App() {
   const inputs = useRef({}); // (host) teclas de cada jugador
   const ball = useRef({ x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] });
   const hostMe = useRef(null); // (invitado) dónde me tiene el host
+  const hostMeHist = useRef({ snaps: [], x: 0, y: 0, vx: 0, vy: 0 }); // (invitado) mis fotos del host, para dibujar el balón pegado a mí
   const lastStateRecv = useRef(0); // (invitado) última foto recibida del host
   // Conexión directa: host -> { [invitado]: { pc, dc, sess } }; invitado -> { pc, dc, ... }
   const p2p = useRef({ peers: {}, guest: null, lastState: 0 });
@@ -1104,6 +1105,7 @@ export default function App() {
     sidMap.current = {};
     inputs.current = {};
     hostMe.current = null;
+    hostMeHist.current.snaps = [];
     ball.current = { x: CX, y: CY, vx: 0, vy: 0, k: 0, trail: [], snaps: [] };
     lastKickoff.current = null;
     lastGoalAt.current = null;
@@ -1253,6 +1255,7 @@ export default function App() {
         } else {
           placeAtSpawn(uid);
           hostMe.current = null;
+          hostMeHist.current.snaps = [];
           for (const id in ents.current) ents.current[id].snaps = [];
         }
         resetBall();
@@ -1379,6 +1382,11 @@ export default function App() {
         if (!p) continue;
         if (id === uid) {
           hostMe.current = { t: lt, x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy };
+          const hs = hostMeHist.current.snaps;
+          if (!hs.length || lt > hs[hs.length - 1].t) {
+            hs.push({ t: lt, x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy });
+            if (hs.length > 20) hs.shift();
+          }
           continue;
         }
         const s = p.snaps;
@@ -1751,6 +1759,7 @@ export default function App() {
     const rOld = { x: 0, y: 0, vx: 0, vy: 0 };
     const ballOff = { x: 0, y: 0 }; // pequeña corrección visual que se va apagando
     let prevHb = null;
+    let attachW = 0; // (invitado) 1 = el balón se dibuja pegado a mi jugador (conducción)
     let myLastKc = kickPresses.current;
 
     // Teclas que estoy pulsando ahora mismo
@@ -2107,7 +2116,8 @@ export default function App() {
 
       // Sin predicción del balón: mi jugador no puede meterse dentro del balón
       // tal y como lo veo (así nunca lo atravieso, por ejemplo contra la pared)
-      if (!predictRef.current) {
+      // (Mientras conduzco, el balón se dibuja pegado a mí y no hace falta)
+      if (!predictRef.current && attachW < 0.05) {
         const b = ball.current;
         if (Number.isFinite(b.x)) {
           stuckBall.x = b.x;
@@ -2225,6 +2235,30 @@ export default function App() {
           ballOff.x = 0;
           ballOff.y = 0;
           interpPlayer(b, renderT, tickRate);
+          // Conducción: si el host me ve tocando el balón, lo dibujo pegado a mi
+          // jugador tal y como lo veo yo (misma posición relativa que en el host).
+          // Así no da tirones contra mi cuerpo al llevarlo.
+          const hmh = hostMeHist.current;
+          const meD = all[uid];
+          let target = 0;
+          if (meD && hmh.snaps.length && !meD.stale) {
+            interpPlayer(hmh, renderT, tickRate);
+            const rx = b.x - hmh.x;
+            const ry = b.y - hmh.y;
+            if (rx * rx + ry * ry < (PLAYER_R + BALL_R + 2) ** 2) target = 1;
+            const up = 1 - Math.exp(-dt * 25);
+            const down = 1 - Math.exp(-dt * 9);
+            attachW += (target - attachW) * (target > attachW ? up : down);
+            if (attachW > 0.001) {
+              let ax = meD.dx + rx;
+              let ay = meD.dy + ry;
+              // Que no se meta en las paredes
+              ay = Math.min(Math.max(ay, PITCH.top + BALL_R), PITCH.bottom - BALL_R);
+              if (ay < GOAL_TOP || ay > GOAL_BOTTOM) ax = Math.min(Math.max(ax, PITCH.left + BALL_R), PITCH.right - BALL_R);
+              b.x = lerp(b.x, ax, attachW);
+              b.y = lerp(b.y, ay, attachW);
+            }
+          } else attachW = 0;
         }
         b.px = b.x;
         b.py = b.y;
