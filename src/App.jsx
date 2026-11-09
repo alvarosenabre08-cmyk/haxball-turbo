@@ -105,7 +105,7 @@ const REST_NET = 0.05;
 // Versión del juego: si una sala se creó con otra versión, los datos no encajan
 // (pasa si alguien no recarga la página después de un cambio). Súbela al cambiar
 // el formato de los datos.
-const GAME_VERSION = 20;
+const GAME_VERSION = 21;
 const MAX_PLAYERS = 12; // 6 contra 6
 const SYNC_MS = 33; // 30 envíos/s
 const SYNC_MS_CROWDED = 50; // 20 envíos/s cuando hay más de 8 jugadores
@@ -416,6 +416,38 @@ const spawnPos = (team, rank = 0) => {
     y: CY + (offsets[rank] ?? 0),
   };
 };
+
+// Control al conducir: si el jugador empuja el balón, el balón acompaña su
+// movimiento de lado en vez de escurrirse por el costado del cuerpo.
+// Solo mientras el jugador va hacia el balón (parado no lo "pega").
+const DRIBBLE_GRIP = 0.5;
+function dribbleGrip(p, b) {
+  const dx = b.x - p.x;
+  const dy = b.y - p.y;
+  const d = Math.hypot(dx, dy);
+  if (d === 0 || d > p.r + b.r + 0.5) return;
+  const nx = dx / d;
+  const ny = dy / d;
+  // Lo que se ha movido de verdad el jugador este tick (su velocidad ya va frenada)
+  const pvx = p.x - (p.px ?? p.x);
+  const pvy = p.y - (p.py ?? p.y);
+  const pushing = pvx * nx + pvy * ny;
+  if (pushing < 0.3) return;
+  const rvx = b.vx - pvx;
+  const rvy = b.vy - pvy;
+  const vn = rvx * nx + rvy * ny;
+  if (vn > 1) return; // el balón ya se va (chut o rebote)
+  // De frente: el balón va justo a la velocidad del pie (sin rebotes pequeñitos)
+  if (vn < 0) {
+    b.vx -= vn * nx;
+    b.vy -= vn * ny;
+  }
+  // De lado: el balón acompaña al jugador en vez de escurrirse
+  const tx = rvx - vn * nx;
+  const ty = rvy - vn * ny;
+  b.vx -= tx * DRIBBLE_GRIP;
+  b.vy -= ty * DRIBBLE_GRIP;
+}
 
 // Choque entre dos discos (igual que Haxball)
 function collide(a, b, restitution) {
@@ -1921,7 +1953,10 @@ export default function App() {
 
         // El balón casi no mueve al jugador (control absoluto)
         p.inv = PLAYER_INV_VS_BALL;
-        if (collide(p, b, REST_PLAYER_BALL)) touched(id);
+        if (collide(p, b, REST_PLAYER_BALL)) {
+          touched(id);
+          dribbleGrip(p, b);
+        }
         p.inv = PLAYER_INV_MASS;
       }
       for (let i = 0; i < POST_DISCS.length; i++) collide(b, POST_DISCS[i], REST_POST);
